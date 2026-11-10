@@ -12,13 +12,12 @@ import { all, get, run, SESSION_DIR } from '../db.js'
 import { handleMessage, notifyPaid, notifyPaymentFailed } from './bot.js'
 import { setNotifier, setFailNotifier } from '../payments.js'
 
-/** id -> { sock, x, status, qr, pairingCode, stopped, timer } */
 const live = new Map()
 const authDir = (id) => path.join(SESSION_DIR, id)
 const setStatus = (id, status, extra = {}) => {
   const l = live.get(id)
   if (l) { l.status = status; Object.assign(l, extra) }
-  run('UPDATE wa_sessions SET status = ?, phone = COALESCE(?, phone) WHERE id = ?', status, extra.phone ?? null, id)
+  run('UPDATE wa_sessions SET status = $1, phone = COALESCE($2, phone) WHERE id = $3', status, extra.phone ?? null, id).catch(() => {})
 }
 
 async function connect(id, { pairPhone } = {}) {
@@ -82,7 +81,8 @@ async function connect(id, { pairPhone } = {}) {
 
 export async function createSession(label, pairPhone) {
   const id = crypto.randomBytes(5).toString('hex')
-  run('INSERT INTO wa_sessions(id, label, status) VALUES (?, ?, ?)', id, label || `Account ${all('SELECT 1 FROM wa_sessions').length + 1}`, 'starting')
+  const count = Number((await get('SELECT COUNT(*) c FROM wa_sessions')).c) + 1
+  await run('INSERT INTO wa_sessions(id, label, status) VALUES ($1, $2, $3)', id, label || `Account ${count}`, 'starting')
   live.set(id, { status: 'starting', qr: null, pairingCode: null, stopped: false })
   await connect(id, { pairPhone })
   return id
@@ -98,25 +98,25 @@ export async function terminateSession(id) {
     live.delete(id)
   }
   fs.rmSync(authDir(id), { recursive: true, force: true })
-  run('DELETE FROM wa_sessions WHERE id = ?', id)
+  await run('DELETE FROM wa_sessions WHERE id = $1', id).catch(() => {})
 }
 
 export async function reconnectSession(id) {
-  const row = get('SELECT * FROM wa_sessions WHERE id = ?', id)
+  const row = await get('SELECT * FROM wa_sessions WHERE id = $1', id)
   if (!row) return false
   const old = live.get(id)
   if (old) { clearTimeout(old.timer); try { old.sock?.end?.(undefined) } catch {} }
   live.set(id, { status: 'starting', qr: null, pairingCode: null, stopped: false })
-  setStatus(id, 'starting')
+  await run('UPDATE wa_sessions SET status = $1 WHERE id = $2', 'starting', id)
   await connect(id)
   return true
 }
 
 export async function listSessions() {
-  const rows = all('SELECT * FROM wa_sessions ORDER BY created_at DESC')
+  const rows = await all('SELECT * FROM wa_sessions ORDER BY created_at DESC')
   return Promise.all(rows.map(async (r) => {
     const l = live.get(r.id)
-    const studentCount = get('SELECT COUNT(*) c FROM students WHERE session_id = ?', r.id).c
+    const studentCount = Number((await get('SELECT COUNT(*) c FROM students WHERE session_id = $1', r.id)).c)
     return {
       ...r,
       status: l?.status || r.status,
@@ -128,9 +128,8 @@ export async function listSessions() {
 }
 
 export async function restoreSessions() {
-  for (const r of all('SELECT * FROM wa_sessions')) {
+  for (const r of await all('SELECT * FROM wa_sessions')) {
     if (r.status === 'logged_out' || !fs.existsSync(authDir(r.id))) {
-      // never paired or logged out: keep the row so the user can remove it, but don't spin up a socket
       live.set(r.id, { status: r.status === 'connected' ? 'logged_out' : r.status, qr: null, pairingCode: null, stopped: false })
       continue
     }
@@ -139,7 +138,6 @@ export async function restoreSessions() {
   }
 }
 
-// tell a student on WhatsApp that their payment went through, via the session that last spoke to them
 const sessionFor = (student) => live.get(student.session_id)?.sock ? live.get(student.session_id) : [...live.values()].find((l) => l.status === 'connected')
 setNotifier(async (student) => {
   const entry = sessionFor(student)

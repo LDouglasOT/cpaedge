@@ -1,0 +1,125 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Admin {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String?
+  role         String   @default("admin")
+  passwordHash String
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  invites      AdminInvite[]
+  transactions Transaction[]
+}
+
+model AdminInvite {
+  id         String   @id @default(cuid())
+  email      String   @unique
+  token      String   @unique
+  role       String   @default("admin")
+  invitedBy  Admin?   @relation(fields: [invitedById], references: [id], onDelete: SetNull)
+  invitedById String?
+  expiresAt  DateTime
+  accepted   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+}
+
+model Course {
+  id          String   @id @default(cuid())
+  name        String
+  description String   @default("")
+  topics      Topic[]
+  createdAt   DateTime @default(now())
+}
+
+model Topic {
+  id          String   @id @default(cuid())
+  name        String
+  courseId    String
+  course      Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  questions   Question[]
+  createdAt   DateTime @default(now())
+}
+
+model Question {
+  id            String   @id @default(cuid())
+  topicId       String
+  topic         Topic    @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  text          String
+  options       String
+  correct       Int
+  explanation   String   @default("")
+  documentFile  String?
+  documentName  String?
+  documentMime  String?
+  attempts      Attempt[]
+  createdAt     DateTime @default(now())
+}
+
+model Student {
+  id            String   @id @default(cuid())
+  phone         String   @unique
+  name          String   @default("")
+  jid           String?
+  sessionId     String?
+  premium       Boolean  @default(false)
+  premiumSince  DateTime?
+  trialsUsed    Int      @default(0)
+  state         String   @default("{}")
+  createdAt     DateTime @default(now())
+  lastSeen      DateTime @default(now())
+  attempts      Attempt[]
+  transactions  Transaction[]
+  waSessions    WASession[]
+}
+
+model Attempt {
+  id          String   @id @default(cuid())
+  studentId   String
+  student     Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  questionId  String
+  question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  selected    Int
+  isCorrect   Boolean
+  createdAt   DateTime @default(now())
+}
+
+model Transaction {
+  id           String   @id @default(cuid())
+  studentId    String?
+  student      Student? @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  phone        String?
+  type         String
+  amount       Float
+  currency     String   @default("UGX")
+  status       String   @default("pending")
+  method       String   @default("")
+  reference    String   @unique
+  providerRef  String?
+  note         String   @default("")
+  createdById  String?
+  createdBy    Admin?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt    DateTime @default(now())
+}
+
+model Setting {
+  key   String @id
+  value String
+}
+
+model WASession {
+  id        String   @id
+  label     String
+  phone     String?
+  status    String   @default("starting")
+  createdAt DateTime @default(now())
+  students  Student[]
+}

@@ -4,11 +4,9 @@ import { all, get, run, getSetting, UPLOAD_DIR } from '../db.js'
 import { initiatePayment, normalizeMsisdn } from '../payments.js'
 import { studentStats } from '../stats.js'
 
-const PAGE = 9 // WhatsApp lists allow 10 rows; the 10th is the "More" row
+const PAGE = 9
 const LETTERS = ['A', 'B', 'C']
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
-const money = (n) => `${getSetting('currency')} ${Number(n).toLocaleString('en-US')}`
-const trialLimit = () => Number(getSetting('trial_limit'))
 
 /* ---------- inbound parsing ---------- */
 
@@ -34,22 +32,28 @@ export function parseIncoming(msg) {
 
 /* ---------- students ---------- */
 
-function upsertStudent({ phone, jid, name, sessionId }) {
-  let s = get('SELECT * FROM students WHERE phone = ?', phone)
+async function upsertStudent({ phone, jid, name, sessionId }) {
+  let s = await get('SELECT * FROM students WHERE phone = $1', phone)
   if (!s) {
-    run('INSERT INTO students(phone, name, jid, session_id) VALUES (?, ?, ?, ?)', phone, name || '', jid, sessionId)
+    s = await get(`INSERT INTO students(phone, name, jid, session_id) VALUES ($1, $2, $3, $4) RETURNING *`, phone, name || '', jid, sessionId)
   } else {
-    run("UPDATE students SET jid = ?, session_id = ?, last_seen = datetime('now'), name = CASE WHEN name = '' THEN ? ELSE name END WHERE id = ?", jid, sessionId, name || '', s.id)
+    s = await get(`UPDATE students SET jid = $1, session_id = $2, last_seen = NOW(), name = CASE WHEN name = '' THEN $3 ELSE name END WHERE id = $4 RETURNING *`, jid, sessionId, name || '', s.id)
   }
-  return get('SELECT * FROM students WHERE phone = ?', phone)
+  return s
 }
 const getState = (s) => { try { return JSON.parse(s.state || '{}') } catch { return {} } }
-const setState = (s, state) => run('UPDATE students SET state = ? WHERE id = ?', JSON.stringify(state), s.id)
-const fresh = (s) => get('SELECT * FROM students WHERE id = ?', s.id)
-const exhausted = (s) => !s.premium && s.trials_used >= trialLimit()
-const hasAttempted = (sid, qid) => !!get('SELECT 1 x FROM attempts WHERE student_id = ? AND question_id = ?', sid, qid)
+const setState = (s, state) => run('UPDATE students SET state = $1 WHERE id = $2', JSON.stringify(state), s.id)
+const fresh = (s) => get('SELECT * FROM students WHERE id = $1', s.id)
+const exhausted = async (s) => !s.premium && s.trialsUsed >= await trialLimit()
+const hasAttempted = async (sid, qid) => !!await get('SELECT 1 FROM attempts WHERE student_id = $1 AND question_id = $2 LIMIT 1', sid, qid)
 
-/* ---------- outbound helpers (each takes the session context) ---------- */
+const money = async (n) => `${await getSetting('currency')} ${Number(n).toLocaleString('en-US')}`
+const trialLimit = async () => Number(await getSetting('trial_limit'))
+const premiumPrice = async () => Number(await getSetting('premium_price'))
+const welcomeMessage = async () => await getSetting('welcome_message')
+const botName = async () => await getSetting('bot_name')
+
+/* ---------- outbound helpers ---------- */
 
 const text = (ctx, jid, body) => ctx.sock.sendMessage(jid, { text: body })
 
@@ -79,19 +83,20 @@ async function pagedList(ctx, jid, { title, body, button, items, prefix, page, m
 /* ---------- flow ---------- */
 
 async function showMenu(ctx, s, jid, { greet = false, page = 0 } = {}) {
-  const courses = all('SELECT c.id, c.name title, c.description, (SELECT COUNT(*) FROM topics t JOIN questions q ON q.topic_id=t.id WHERE t.course_id=c.id) qn FROM courses c ORDER BY c.name')
-    .filter((c) => c.qn > 0)
+  const courses = await all(`
+    SELECT c.id, c.name title, c.description,
+      (SELECT COUNT(*) FROM questions q JOIN topics t ON t.id = q.topic_id WHERE t.course_id = c.id) qn
+    FROM courses c ORDER BY c.name`)
     .map((c) => ({ ...c, description: `${c.qn} question${c.qn === 1 ? '' : 's'}${c.description ? ' · ' + c.description : ''}` }))
-  setState(s, {})
+    .filter((c) => c.qn > 0)
+  await setState(s, {})
   if (greet) {
     const name = (s.name || '').split(' ')[0]
-    const welcome = getSetting('welcome_message')
-      .replaceAll('{bot}', getSetting('bot_name'))
-      .replaceAll('{trials}', String(trialLimit()))
+    const welcome = await welcomeMessage().replaceAll('{bot}', await botName()).replaceAll('{trials}', String(await trialLimit()))
     await text(ctx, jid, `Hello${name ? ' ' + name : ''} 👋\n\n${welcome}`)
   }
   if (!courses.length) return text(ctx, jid, 'No courses are available yet. Please check back soon.')
-  const status = s.premium ? '⭐ Premium — unlimited practice' : `🎁 Free trial: ${Math.max(0, trialLimit() - s.trials_used)} of ${trialLimit()} questions left`
+  const status = s.premium ? '⭐ Premium — unlimited practice' : `🎁 Free trial: ${Math.max(0, await trialLimit() - s.trialsUsed)} of ${await trialLimit()} questions left`
   await pagedList(ctx, jid, {
     title: 'Courses', body: `Select a course to attempt.\n${status}\n\nType *rank* any time to see your ranking.`,
     button: 'Choose course', items: courses, prefix: 'course', page, moreId: 'courses',
@@ -99,12 +104,14 @@ async function showMenu(ctx, s, jid, { greet = false, page = 0 } = {}) {
 }
 
 async function showTopics(ctx, s, jid, courseId, page = 0) {
-  const course = get('SELECT * FROM courses WHERE id = ?', courseId)
+  const course = await get('SELECT * FROM courses WHERE id = $1', courseId)
   if (!course) return showMenu(ctx, s, jid)
-  const topics = all('SELECT t.id, t.name title, COUNT(q.id) qn FROM topics t LEFT JOIN questions q ON q.topic_id=t.id WHERE t.course_id=? GROUP BY t.id HAVING qn > 0 ORDER BY t.name', courseId)
-    .map((t) => ({ ...t, description: `${t.qn} question${t.qn === 1 ? '' : 's'}` }))
+  const topics = await all(`SELECT t.id, t.name title,
+    (SELECT COUNT(*) FROM questions q WHERE q.topic_id = t.id) qn
+    FROM topics t WHERE t.course_id = $1 ORDER BY t.name`, courseId)
+    .filter((t) => t.qn > 0)
   if (!topics.length) { await text(ctx, jid, `*${course.name}* has no questions yet.`); return showMenu(ctx, s, jid) }
-  setState(s, { courseId })
+  await setState(s, { courseId })
   await pagedList(ctx, jid, {
     title: clip(course.name, 24), body: `*${course.name}*\nChoose a sub topic to practise.`, button: 'Choose topic',
     items: topics, prefix: 'topic', page, moreId: `topics:${courseId}`,
@@ -112,31 +119,29 @@ async function showTopics(ctx, s, jid, courseId, page = 0) {
   })
 }
 
-function pickQuestion(s, topicId, afterId = 0) {
-  const qs = all('SELECT * FROM questions WHERE topic_id = ? ORDER BY id', topicId)
+async function pickQuestion(s, topicId) {
+  const qs = await all('SELECT * FROM questions WHERE topic_id = $1 ORDER BY created_at', topicId)
   if (!qs.length) return { q: null }
-  const seen = new Set(all('SELECT DISTINCT question_id FROM attempts WHERE student_id = ?', s.id).map((r) => r.question_id))
-  const unseenAfter = qs.find((q) => q.id > afterId && !seen.has(q.id))
-  const unseen = unseenAfter || qs.find((q) => !seen.has(q.id))
+  const seen = new Set((await all('SELECT question_id FROM attempts WHERE student_id = $1', s.id)).map((r) => r.question_id))
+  const unseen = qs.find((q) => !seen.has(q.id))
   if (unseen) return { q: unseen }
-  // everything answered already: cycle onward from the current question
-  return { q: qs.find((q) => q.id > afterId) || qs[0], completed: true }
+  return { q: qs[0], completed: true }
 }
 
 async function sendPaywall(ctx, s, jid) {
-  setState(s, { step: 'paywall' })
-  const price = money(getSetting('premium_price'))
+  await setState(s, { step: 'paywall' })
+  const price = await money(await premiumPrice())
   await buttons(ctx, jid,
-    `🔒 You've used all *${trialLimit()} free trial questions*.\n\nUnlock unlimited questions, explanations and ranking with a one-time payment of *${price}*.`,
+    `🔒 You've used all *${await trialLimit()} free trial questions*.\n\nUnlock unlimited questions, explanations and ranking with a one-time payment of *${price}*.`,
     [{ id: 'pay', text: 'Mobile Money Pay' }], 'Pay securely with MTN or Airtel Money')
 }
 
 async function serveQuestion(ctx, s, jid, q, { completed = false } = {}) {
-  s = fresh(s)
+  s = await fresh(s)
   if (!q) return text(ctx, jid, 'There are no questions in this topic yet.')
-  if (exhausted(s)) return sendPaywall(ctx, s, jid)
-  const topic = get('SELECT t.id, t.name, t.course_id FROM topics t WHERE t.id = ?', q.topic_id)
-  setState(s, { step: 'answering', courseId: topic.course_id, topicId: topic.id, questionId: q.id })
+  if (await exhausted(s)) return sendPaywall(ctx, s, jid)
+  const topic = await get('SELECT t.id, t.name, t.course_id FROM topics t WHERE t.id = $1', q.topic_id)
+  await setState(s, { step: 'answering', courseId: topic.course_id, topicId: topic.id, questionId: q.id })
 
   if (q.document_file) {
     const file = path.join(UPLOAD_DIR, q.document_file)
@@ -149,28 +154,28 @@ async function serveQuestion(ctx, s, jid, q, { completed = false } = {}) {
     }
   }
 
-  const opts = JSON.parse(q.options)
+  const opts = JSON.parse(q.options || '[]')
   const note = completed ? '🔁 You have answered every question in this topic — cycling through them again.\n\n' : ''
   const body = `${note}*${topic.name}*\n\n${q.text}\n\n${opts.map((o, i) => `*${LETTERS[i]}.* ${o}`).join('\n')}`
-  const footer = s.premium ? 'Premium' : `Trial ${Math.min(s.trials_used + (hasAttempted(s.id, q.id) ? 0 : 1), trialLimit())} of ${trialLimit()}`
+  const footer = s.premium ? 'Premium' : `Trial ${Math.min(s.trials_used + (await hasAttempted(s.id, q.id) ? 0 : 1), await trialLimit())} of ${await trialLimit()}`
   await buttons(ctx, jid, body, opts.map((o, i) => ({ id: `ans:${q.id}:${i}`, text: `${LETTERS[i]}. ${o}` })), footer)
 }
 
 async function handleAnswer(ctx, s, jid, qid, idx) {
-  const q = get('SELECT * FROM questions WHERE id = ?', qid)
+  const q = await get('SELECT * FROM questions WHERE id = $1', qid)
   if (!q) return showMenu(ctx, s, jid)
-  const opts = JSON.parse(q.options)
+  const opts = JSON.parse(q.options || '[]')
   if (!(idx >= 0 && idx < opts.length)) return
-  if (exhausted(fresh(s)) && !hasAttempted(s.id, qid)) return sendPaywall(ctx, s, jid)
+  if (await exhausted(await fresh(s)) && !(await hasAttempted(s.id, qid))) return sendPaywall(ctx, s, jid)
 
-  const first = !hasAttempted(s.id, qid)
+  const first = !(await hasAttempted(s.id, qid))
   const correct = idx === q.correct
-  run('INSERT INTO attempts(student_id, question_id, selected, is_correct) VALUES (?, ?, ?, ?)', s.id, qid, idx, correct ? 1 : 0)
-  if (first && !s.premium) run('UPDATE students SET trials_used = trials_used + 1 WHERE id = ?', s.id)
-  s = fresh(s)
-  setState(s, { ...getState(s), step: 'feedback', questionId: qid })
+  await run('INSERT INTO attempts(student_id, question_id, selected, is_correct) VALUES ($1, $2, $3, $4)', s.id, qid, idx, correct)
+  if (first && !s.premium) await run('UPDATE students SET trials_used = trials_used + 1 WHERE id = $1', s.id)
+  s = await fresh(s)
+  await setState(s, { ...getState(s), step: 'feedback', questionId: qid })
 
-  const done = exhausted(s)
+  const done = await exhausted(s)
   const head = correct
     ? `✅ *Correct!* ${LETTERS[idx]}. ${opts[idx]} is the right answer.`
     : `❌ *Wrong answer.* You chose ${LETTERS[idx]}. ${opts[idx]}.\nTap *Explain* to see the correct answer and why, or *Re-attempt* to try again.`
@@ -184,21 +189,21 @@ async function handleAnswer(ctx, s, jid, qid, idx) {
 }
 
 async function handleExplain(ctx, s, jid, qid) {
-  const q = get('SELECT * FROM questions WHERE id = ?', qid)
+  const q = await get('SELECT * FROM questions WHERE id = $1', qid)
   if (!q) return showMenu(ctx, s, jid)
-  const opts = JSON.parse(q.options)
+  const opts = JSON.parse(q.options || '[]')
   const body = `💡 *Explanation*\n\n${q.text}\n\n✅ Correct answer: *${LETTERS[q.correct]}. ${opts[q.correct]}*\n\n${q.explanation?.trim() || 'No explanation has been added for this question yet.'}`
-  s = fresh(s)
-  if (exhausted(s)) { await text(ctx, jid, body); return sendPaywall(ctx, s, jid) }
+  s = await fresh(s)
+  if (await exhausted(s)) { await text(ctx, jid, body); return sendPaywall(ctx, s, jid) }
   await buttons(ctx, jid, body, [{ id: `next:${qid}`, text: 'Next question' }, { id: `retry:${qid}`, text: 'Re-attempt' }])
 }
 
 async function handleRank(ctx, s, jid) {
-  const { me, total, top } = studentStats(s.id)
+  const { me, total, top } = await studentStats(s.id)
   if (!me) return text(ctx, jid, '📊 You have not answered any questions yet. Say *hi* to pick a course and start!')
   const mask = (r) => `${(r.name || 'Student').split(' ')[0]} …${r.phone.slice(-3)}`
   const medals = ['🥇', '🥈', '🥉']
-  const left = s.premium ? 'Premium (unlimited)' : `${Math.max(0, trialLimit() - s.trials_used)} free question(s) left`
+  const left = s.premium ? 'Premium (unlimited)' : `${Math.max(0, await trialLimit() - s.trials_used)} free question(s) left`
   await text(ctx, jid,
     `📊 *Your stats*\n\n🏆 Rank: *#${me.rank}* of ${total} student${total === 1 ? '' : 's'}\n` +
     `📝 Questions attempted: *${me.attempted}*\n✅ Answered correctly: *${me.correct}*\n🎯 Accuracy: *${me.accuracy}%* (${me.correct_attempts} of ${me.total_attempts} attempts)\n🎁 Access: ${left}\n\n` +
@@ -208,11 +213,11 @@ async function handleRank(ctx, s, jid) {
 async function startPayment(ctx, s, jid, msisdn) {
   try {
     const { amount, currency } = await initiatePayment({ student: s, msisdn })
-    setState(s, { step: 'awaiting_payment' })
+    await setState(s, { step: 'awaiting_payment' })
     await text(ctx, jid, `📲 A mobile money prompt for *${currency} ${amount.toLocaleString('en-US')}* has been sent to *${msisdn}*.\n\nApprove it on your phone with your PIN. I'll unlock your account the moment it's confirmed.`)
   } catch (err) {
     console.error('[bot] payment failed:', err.message)
-    setState(s, { step: 'paywall' })
+    await setState(s, { step: 'paywall' })
     await buttons(ctx, jid, "⚠️ We couldn't start that payment. Please try again in a moment.", [{ id: 'pay', text: 'Mobile Money Pay' }])
   }
 }
@@ -234,7 +239,7 @@ async function process(ctx, msg, jid) {
   if (!input) return
   const realJid = msg.key.remoteJidAlt || msg.key.senderPn || jid
   const phone = realJid.split('@')[0].split(':')[0]
-  let s = upsertStudent({ phone, jid, name: msg.pushName, sessionId: ctx.sessionId })
+  let s = await upsertStudent({ phone, jid, name: msg.pushName, sessionId: ctx.sessionId })
   const state = getState(s)
   const { id } = input
   const raw = (input.text || '').trim()
@@ -245,28 +250,27 @@ async function process(ctx, msg, jid) {
     switch (kind) {
       case 'menu': return showMenu(ctx, s, jid)
       case 'courses': return showMenu(ctx, s, jid, { page: Number(a) || 0 })
-      case 'course': return showTopics(ctx, s, jid, Number(a))
-      case 'topics': return showTopics(ctx, s, jid, Number(a), Number(b) || 0)
+      case 'course': return showTopics(ctx, s, jid, a)
+      case 'topics': return showTopics(ctx, s, jid, a, Number(b) || 0)
       case 'topic': {
-        const { q, completed } = pickQuestion(s, Number(a))
+        const { q, completed } = await pickQuestion(s, a)
         return serveQuestion(ctx, s, jid, q, { completed })
       }
-      case 'ans': return handleAnswer(ctx, s, jid, Number(a), Number(b))
-      case 'retry': return serveQuestion(ctx, s, jid, get('SELECT * FROM questions WHERE id = ?', Number(a)))
-      case 'explain': return handleExplain(ctx, s, jid, Number(a))
+      case 'ans': return handleAnswer(ctx, s, jid, a, Number(b))
+      case 'retry': return serveQuestion(ctx, s, jid, await get('SELECT * FROM questions WHERE id = $1', a))
+      case 'explain': return handleExplain(ctx, s, jid, a)
       case 'next': {
-        const cur = get('SELECT * FROM questions WHERE id = ?', Number(a))
+        const cur = await get('SELECT * FROM questions WHERE id = $1', a)
         if (!cur) return showMenu(ctx, s, jid)
-        const { q, completed } = pickQuestion(s, cur.topic_id, cur.id)
+        const { q, completed } = await pickQuestion(s, cur.topic_id)
         return serveQuestion(ctx, s, jid, q, { completed })
       }
       case 'pay':
-        setState(s, { step: 'await_msisdn' })
-        return text(ctx, jid, `💳 Which mobile money number should we charge *${money(getSetting('premium_price'))}* to?\n\nReply with the number (e.g. 0771234567), or reply *same* to use this WhatsApp number.`)
+        await setState(s, { step: 'await_msisdn' })
+        return text(ctx, jid, `💳 Which mobile money number should we charge *${await money(await premiumPrice())}* to?\n\nReply with the number (e.g. 0771234567), or reply *same* to use this WhatsApp number.`)
     }
   }
 
-  // free-text commands
   if (/^(rank|ranking|my rank|stats|my stats|position)$/i.test(lower)) return handleRank(ctx, s, jid)
 
   if (state.step === 'await_msisdn') {
@@ -275,40 +279,36 @@ async function process(ctx, msg, jid) {
     return startPayment(ctx, s, jid, msisdn)
   }
 
-  // typed fallbacks for the quiz
   if (state.step === 'answering' && /^[abc]\.?$/.test(lower)) {
-    return handleAnswer(ctx, s, jid, state.questionId, 'abc'.indexOf(lower[0]))
+    return handleAnswer(ctx, s, jid, state.question_id, 'abc'.indexOf(lower[0]))
   }
-  if (state.questionId && /^(next|next question)$/.test(lower)) {
-    const cur = get('SELECT * FROM questions WHERE id = ?', state.questionId)
-    if (cur) { const { q, completed } = pickQuestion(s, cur.topic_id, cur.id); return serveQuestion(ctx, s, jid, q, { completed }) }
+  if (state.question_id && /^(next|next question)$/.test(lower)) {
+    const cur = await get('SELECT * FROM questions WHERE id = $1', state.question_id)
+    if (cur) { const { q, completed } = await pickQuestion(s, cur.topic_id); return serveQuestion(ctx, s, jid, q, { completed }) }
   }
-  if (state.questionId && /^(retry|re-?attempt|try again)$/.test(lower)) return serveQuestion(ctx, s, jid, get('SELECT * FROM questions WHERE id = ?', state.questionId))
-  if (state.questionId && /^(explain|explanation)$/.test(lower)) return handleExplain(ctx, s, jid, state.questionId)
+  if (state.question_id && /^(retry|re-?attempt|try again)$/.test(lower)) return serveQuestion(ctx, s, jid, await get('SELECT * FROM questions WHERE id = $1', state.question_id))
+  if (state.question_id && /^(explain|explanation)$/.test(lower)) return handleExplain(ctx, s, jid, state.question_id)
   if (state.step === 'paywall' && /^(pay|buy|upgrade)$/.test(lower)) {
-    setState(s, { step: 'await_msisdn' })
+    await setState(s, { step: 'await_msisdn' })
     return text(ctx, jid, 'Reply with the mobile money number to charge (e.g. 0771234567), or *same* to use this WhatsApp number.')
   }
 
-  // greeting / anything else → welcome + course menu
-  const isNew = !state.greeted && !all('SELECT 1 FROM attempts WHERE student_id = ? LIMIT 1', s.id).length
+  const isNew = !state.greeted && Number((await get('SELECT COUNT(*) c FROM attempts WHERE student_id = $1', s.id)).c) === 0
   const isGreeting = /^(hi+|hello+|hey+|hie|hola|start|menu|courses|good\s+(morning|afternoon|evening))\b/i.test(raw)
   if (isGreeting || isNew) {
     await showMenu(ctx, s, jid, { greet: true })
-    return setState(fresh(s), { greeted: true })
+    return setState(await fresh(s), { greeted: true })
   }
   if (!state.step) return showMenu(ctx, s, jid)
   return text(ctx, jid, 'Say *hi* for the course menu, or *rank* to see your ranking.')
 }
 
-/** Called by payments.js once a payment is confirmed. */
 export async function notifyPaid(ctx, student) {
   const jid = student.jid
   if (!jid) return
   await buttons(ctx, jid, `🎉 Payment received — you're now *Premium*! You have unlimited questions, explanations and ranking.`, [{ id: 'menu', text: 'Choose a course' }])
 }
 
-/** Called by payments.js when MarzPay reports the payment failed. */
 export async function notifyPaymentFailed(ctx, student) {
   if (!student.jid) return
   await buttons(ctx, student.jid, "⚠️ Your mobile money payment wasn't completed (declined, cancelled or timed out). No money was taken. Tap below to try again.", [{ id: 'pay', text: 'Mobile Money Pay' }])

@@ -164,6 +164,7 @@ export default function QuestionBank() {
           <div className="row between" style={{ marginBottom: 10 }}>
             <h2>{topic ? `${topic.name} · questions` : 'Questions'}</h2>
             <button className="btn sm primary" disabled={!topic} onClick={() => setModal({ type: 'question' })}>+ Add question</button>
+            <button className="btn sm" disabled={!topic} onClick={() => setModal({ type: 'bulk' })}>Bulk import</button>
           </div>
           {!topic ? <div className="empty">Select a sub topic to see and add its questions.</div> : !questions.data?.length ? <div className="empty">No questions yet. Add the first one.</div> : (
             questions.data.map((q, n) => (
@@ -203,6 +204,62 @@ export default function QuestionBank() {
       {modal?.type === 'question' && (
         <QuestionModal topicId={topicId} question={modal.item} onClose={() => setModal(null)} onSaved={() => { setModal(null); refreshAll() }} />
       )}
+      {modal?.type === 'bulk' && (
+        <BulkImportModal topicId={topicId} onClose={() => setModal(null)} onSaved={() => { setModal(null); refreshAll() }} />
+      )}
     </>
+  )
+}
+
+function BulkImportModal({ topicId, onClose, onSaved }) {
+  const [text, setText] = useState('')
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [preview, setPreview] = useState(null)
+  const submit = async (e) => {
+    e.preventDefault(); setErr('')
+    setBusy(true)
+    try {
+      const { imported } = await api(`/topics/${topicId}/questions/bulk`, { method: 'POST', body: { text } })
+      onSaved()
+    } catch (e2) { setErr(e2.message); setBusy(false) }
+  }
+  const analyze = () => {
+    const lines = String(text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+    let valid = 0, errors = 0
+    for (const line of lines) {
+      const parts = line.split('|').map((p) => p.trim())
+      if (parts.length < 4) { errors++; continue }
+      const optionList = parts.slice(0, -2)
+      const correctIndex = Number(parts[parts.length - 2])
+      if (optionList.length < 2 || !Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex >= optionList.length) { errors++; continue }
+      valid++
+    }
+    setPreview({ valid, errors, total: lines.length })
+  }
+  return (
+    <Modal title={`Bulk import questions (max 2000)`} onClose={onClose}>
+      <form className="form" onSubmit={submit}>
+        <label className="f"><span>Questions <small className="muted" style={{ fontWeight: 400 }}>(one per line, max 2000)</small></span>
+          <textarea value={text} onChange={(e) => { setText(e.target.value); analyze() }} rows={14} placeholder="What is the capital of Uganda?|Kampala|Nairobi|Kigali|0|It is the capital city." /></label>
+        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Format</span>
+          <div className="muted" style={{ fontSize: 12, lineHeight: 1.6 }}>
+            `text&#124;option A&#124;option B&#124;option C&#124;correct index (0-based)&#124;explanation`<br />
+            Example: `What is 2+2?&#124;3&#124;4&#124;5&#124;2&#124;Because 2+2=4`<br />
+            Use at least 2 options, at most 3. Correct index starts at 0. Explanation is optional.
+          </div>
+        </div>
+        {preview && (
+          <div style={{ padding: 10, background: 'var(--bg)', borderRadius: 8, marginBottom: 10 }}>
+            {preview.valid} valid · {preview.errors} invalid of {preview.total} lines
+          </div>
+        )}
+        {err && <div className="err">{err}</div>}
+        <div className="row" style={{ justifyContent: 'flex-end' }}>
+          <button type="button" className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn primary" disabled={busy || !text.trim()}>{busy ? 'Importing…' : 'Import questions'}</button>
+        </div>
+      </form>
+    </Modal>
   )
 }

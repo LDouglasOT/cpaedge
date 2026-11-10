@@ -3,10 +3,10 @@ import multer from 'multer'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { all, get, run, allSettings, setSetting, UPLOAD_DIR } from './db.js'
-import { checkPassword, issueToken, requireAuth } from './auth.js'
-import { dashboard, leaderboard } from './stats.js'
-import { balance, confirmPayment, failPayment } from './payments.js'
+import { all, get, run, allSettings, setSetting, getSetting, loadSettings, UPLOAD_DIR } from './db.js'
+import { checkPassword, issueToken, requireAuth, requireRole, authenticateAdmin, bootstrapAdmin, hashPassword } from './auth.js'
+import { dashboard, leaderboard, studentStats } from './stats.js'
+import { balance, confirmPayment, failPayment, confirmWithdrawal, failWithdrawal, initiatePayment, initiateWithdrawal } from './payments.js'
 import { createSession, listSessions, reconnectSession, terminateSession } from './whatsapp/manager.js'
 
 const upload = multer({
@@ -24,11 +24,15 @@ const rmFile = (name) => name && fs.rmSync(path.join(UPLOAD_DIR, name), { force:
 export const publicRouter = express.Router()
 export const api = express.Router()
 
-/* ---------- auth + payment webhooks (no token) ---------- */
-publicRouter.post('/login', (req, res) => {
-  if (!checkPassword(req.body?.password)) return res.status(401).json({ error: 'Wrong password' })
-  res.json({ token: issueToken() })
-})
+/* ---------- bootstrap + auth (no token) ---------- */
+publicRouter.post('/login', wrap(async (req, res) => {
+  await bootstrapAdmin()
+  const email = String(req.body?.email || 'admin@local')
+  const password = String(req.body?.password || '')
+  const admin = await authenticateAdmin(email, password)
+  if (!admin) return res.status(401).json({ error: 'Wrong credentials' })
+  res.json({ token: issueToken(admin.id), admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role } })
+}))
 
 publicRouter.post('/payments/webhook/marzpay', wrap(async (req, res) => {
   const secret = process.env.MARZPAY_WEBHOOK_SECRET
@@ -36,7 +40,6 @@ publicRouter.post('/payments/webhook/marzpay', wrap(async (req, res) => {
     console.error('[marzpay] webhook rejected: MARZPAY_WEBHOOK_SECRET is not set')
     return res.sendStatus(503)
   }
-  // Signature header looks like "t=<unix seconds>,v1=<hex hmac of "<t>.<raw body>">"
   const header = String(req.headers['x-marzpay-signature'] || '')
   const parts = Object.fromEntries(header.split(',').map((kv) => kv.trim().split('=')))
   const ts = String(req.headers['x-marzpay-timestamp'] || parts.t || '')
@@ -47,14 +50,25 @@ publicRouter.post('/payments/webhook/marzpay', wrap(async (req, res) => {
   if (!okSig || !fresh) return res.sendStatus(401)
 
   const { event_type: event, transaction: t = {} } = req.body || {}
-  const tx = t.reference && get("SELECT * FROM transactions WHERE reference = ? AND type = 'payment'", t.reference)
-  if (tx) {
+  const reference = t.reference
+  if (!reference) return res.sendStatus(200)
+
+  const tx = await get('SELECT * FROM transactions WHERE reference = $1', reference)
+  if (!tx) return res.sendStatus(200)
+
+  if (tx.type === 'payment') {
     if (event === 'collection.completed') {
       const paid = Number(t.amount?.raw ?? tx.amount)
-      if (paid + 0.01 < tx.amount) console.error(`[marzpay] ${t.reference}: paid ${paid} but expected ${tx.amount}; left pending for manual review`)
-      else await confirmPayment(t.reference)
+      if (paid + 0.01 < tx.amount) console.error(`[marzpay] ${reference}: paid ${paid} but expected ${tx.amount}; left pending for manual review`)
+      else await confirmPayment(reference)
     } else if (event === 'collection.failed') {
-      await failPayment(t.reference, 'Payment declined or timed out')
+      await failPayment(reference, 'Payment declined or timed out')
+    }
+  } else if (tx.type === 'withdrawal') {
+    if (event === 'disbursement.completed') {
+      await confirmWithdrawal(reference)
+    } else if (event === 'disbursement.failed' || event === 'disbursement.cancelled') {
+      await failWithdrawal(reference, `Disbursement ${event}`)
     }
   }
   res.sendStatus(200)
@@ -62,16 +76,81 @@ publicRouter.post('/payments/webhook/marzpay', wrap(async (req, res) => {
 
 api.use(requireAuth)
 
+/* ---------- admin management ---------- */
+api.get('/admins', wrap(async (_req, res) => {
+  const admins = await all(`SELECT a.id, a.email, a.name, a.role, a.active, a.created_at, a.updated_at,
+       (SELECT COUNT(*) FROM admin_invites i WHERE i.invited_by_id = a.id) invite_count
+     FROM admins a ORDER BY a.created_at DESC`)
+  res.json(admins)
+}))
+
+api.post('/admins/invite', wrap(async (req, res) => {
+  const { email, role = 'admin' } = req.body || {}
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) return bad(res, 'Valid email is required')
+  if (!['admin', 'owner'].includes(role)) return bad(res, 'Invalid role')
+  const existing = await get('SELECT 1 FROM admins WHERE email = $1', String(email))
+  if (existing) return bad(res, 'An admin with this email already exists')
+  const token = crypto.randomBytes(16).toString('hex')
+  const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7).toISOString()
+  await run(
+    `INSERT INTO admin_invites(id, email, token, role, invited_by_id, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    crypto.randomBytes(8).toString('hex'), String(email), token, role, req.admin.id, expiresAt,
+  )
+  res.status(201).json({ email, role, token, expiresAt, invitedBy: { name: req.admin.name, email: req.admin.email } })
+}))
+
+api.post('/admins/invite/accept', wrap(async (req, res) => {
+  const { token, password, name } = req.body || {}
+  if (!token || !password || password.length < 8) return bad(res, 'Token and a password (8+ chars) are required')
+  const invite = await get('SELECT * FROM admin_invites WHERE token = $1', token)
+  if (!invite || invite.accepted) return res.status(400).json({ error: 'Invalid or already used invitation' })
+  if (new Date(invite.expires_at) < new Date()) return res.status(400).json({ error: 'Invitation has expired' })
+  const hash = await hashPassword(String(password))
+  await run('BEGIN')
+  try {
+    await run('INSERT INTO admins(id, email, name, role, password_hash) VALUES ($1, $2, $3, $4, $5)', crypto.randomBytes(8).toString('hex'), invite.email, name || null, invite.role, hash)
+    await run('UPDATE admin_invites SET accepted = true WHERE id = $1', invite.id)
+    await run('COMMIT')
+  } catch (e) {
+    await run('ROLLBACK')
+    throw e
+  }
+  res.json({ ok: true })
+}))
+
+api.put('/admins/:id', wrap(async (req, res) => {
+  const { role, active, name } = req.body || {}
+  if (req.params.id === req.admin.id && active === false) return bad(res, 'You cannot deactivate yourself')
+  const sets = []
+  const params = []
+  let i = 1
+  if (role !== undefined) { if (!['admin', 'owner'].includes(role)) return bad(res, 'Invalid role'); sets.push(`role = $${i++}`); params.push(role) }
+  if (active !== undefined) { sets.push(`active = $${i++}`); params.push(Boolean(active)) }
+  if (name !== undefined) { sets.push(`name = $${i++}`); params.push(name) }
+  if (sets.length === 0) return bad(res, 'Nothing to update')
+  params.push(req.params.id)
+  const admin = await get(`UPDATE admins SET ${sets.join(', ')} WHERE id = $${i} RETURNING id, email, name, role, active`, ...params)
+  res.json(admin)
+}))
+
+api.delete('/admins/:id', wrap(async (req, res) => {
+  if (req.params.id === req.admin.id) return bad(res, 'You cannot delete yourself')
+  await run('DELETE FROM admins WHERE id = $1', req.params.id)
+  res.json({ ok: true })
+}))
+
 /* ---------- dashboard / settings ---------- */
-api.get('/dashboard', (_req, res) => res.json(dashboard()))
-api.get('/settings', (_req, res) => res.json(allSettings()))
-api.put('/settings', (req, res) => {
+api.get('/dashboard', wrap(async (_req, res) => res.json(await dashboard())))
+api.get('/settings', wrap(async (_req, res) => res.json(await allSettings())))
+api.put('/settings', wrap(async (req, res) => {
   const b = req.body || {}
   if (b.premium_price !== undefined && !(Number.isInteger(Number(b.premium_price)) && Number(b.premium_price) >= 500 && Number(b.premium_price) <= 10000000)) return bad(res, 'Premium price must be a whole number between 500 and 10,000,000 (MarzPay limits)')
   if (b.trial_limit !== undefined && !(Number.isInteger(Number(b.trial_limit)) && Number(b.trial_limit) >= 0)) return bad(res, 'Trial limit must be a whole number')
-  for (const k of ['premium_price', 'currency', 'trial_limit', 'bot_name', 'welcome_message']) if (b[k] !== undefined) setSetting(k, b[k])
-  res.json(allSettings())
-})
+  for (const k of ['premium_price', 'currency', 'trial_limit', 'bot_name', 'welcome_message']) if (b[k] !== undefined) await setSetting(k, b[k])
+  loadSettings()
+  res.json(await allSettings())
+}))
 
 /* ---------- WhatsApp ---------- */
 api.get('/whatsapp/sessions', wrap(async (_req, res) => res.json(await listSessions())))
@@ -89,107 +168,124 @@ api.delete('/whatsapp/sessions/:id', wrap(async (req, res) => {
 }))
 
 /* ---------- funds ---------- */
-api.get('/funds', (req, res) => {
+api.get('/funds', wrap(async (req, res) => {
   const { type, status } = req.query
-  const where = [], params = []
-  if (type) { where.push('t.type = ?'); params.push(type) }
-  if (status) { where.push('t.status = ?'); params.push(status) }
-  const transactions = all(
-    `SELECT t.*, s.name student_name FROM transactions t LEFT JOIN students s ON s.id = t.student_id
-     ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY t.id DESC LIMIT 500`, ...params)
-  const counts = get(`SELECT
-      SUM(type='payment' AND status='success') payments,
-      SUM(type='withdrawal') withdrawals,
-      SUM(status='pending') pending
-    FROM transactions`)
-  res.json({ ...balance(), counts, transactions })
-})
+  const where = []
+  const params = []
+  let i = 1
+  if (type) { where.push(`type = $${i++}`); params.push(type) }
+  if (status) { where.push(`status = $${i++}`); params.push(status) }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+  const [transactions, b] = await Promise.all([
+    all(`SELECT t.*, s.name student_name FROM transactions t LEFT JOIN students s ON s.id = t.student_id
+      ${whereSql} ORDER BY t.id DESC LIMIT 500`, ...params),
+    balance(),
+  ])
+  res.json({ ...b, transactions })
+}))
 
-api.post('/funds/withdraw', (req, res) => {
+api.post('/funds/withdraw', wrap(async (req, res) => {
   const amount = Number(req.body?.amount)
   const phone = String(req.body?.phone || '').trim()
   const method = String(req.body?.method || 'mobile_money')
+  const note = String(req.body?.note || '')
   if (!(amount > 0)) return bad(res, 'Enter a valid amount')
-  if (!phone) return bad(res, 'Enter the account or mobile money number to pay out to')
-  if (amount > balance().available) return bad(res, 'Amount is more than your available balance')
+  if (!phone) return bad(res, 'Enter the mobile money number to pay out to')
+  const b = await balance()
+  if (amount > b.available) return bad(res, 'Amount is more than your available balance')
   const reference = `WD-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
-  run(`INSERT INTO transactions(phone, type, amount, currency, status, method, reference, note)
-       VALUES (?, 'withdrawal', ?, ?, 'pending', ?, ?, ?)`, phone, amount, allSettings().currency, method, reference, String(req.body?.note || ''))
-  res.status(201).json({ reference, ...balance() })
-})
+  const currency = await getSetting('currency')
+  const tx = await get(`INSERT INTO transactions(phone, type, amount, currency, status, method, note, reference, created_by_id)
+    VALUES ($1, 'withdrawal', $2, $3, 'pending', $4, $5, $6, $7) RETURNING id`,
+    phone, amount, currency, method, note, reference, req.admin.id)
+  try {
+    const { providerRef } = await initiateWithdrawal({ amount, phone, method, note, createdById: req.admin.id })
+    await run('UPDATE transactions SET provider_ref = $1 WHERE id = $2', providerRef, tx.id)
+  } catch (err) {
+    await run('UPDATE transactions SET status = $1, note = $2 WHERE id = $3', 'failed', String(err.message).slice(0, 200), tx.id)
+    throw err
+  }
+  res.status(201).json({ reference, ...(await balance()) })
+}))
 
-// Mark a pending withdrawal as paid out (or failed), or confirm a pending payment by hand.
 api.post('/transactions/:id/resolve', wrap(async (req, res) => {
-  const tx = get('SELECT * FROM transactions WHERE id = ?', Number(req.params.id))
+  const tx = await get('SELECT * FROM transactions WHERE id = $1', req.params.id)
   if (!tx) return res.status(404).json({ error: 'Not found' })
   if (tx.status !== 'pending') return bad(res, 'Transaction is not pending')
   const outcome = req.body?.outcome === 'failed' ? 'failed' : 'success'
   if (tx.type === 'payment' && outcome === 'success') await confirmPayment(tx.reference)
-  else run('UPDATE transactions SET status = ? WHERE id = ?', outcome, tx.id)
-  res.json({ ok: true, ...balance() })
+  else if (tx.type === 'withdrawal' && outcome === 'success') await confirmWithdrawal(tx.reference)
+  else await run('UPDATE transactions SET status = $1 WHERE id = $2', outcome, tx.id)
+  res.json({ ok: true, ...(await balance()) })
 }))
 
 /* ---------- students ---------- */
-api.get('/students', (_req, res) => {
-  const board = Object.fromEntries(leaderboard().map((r) => [r.id, r]))
-  res.json(all('SELECT id, phone, name, premium, trials_used, created_at, last_seen FROM students ORDER BY id DESC LIMIT 500')
-    .map((s) => ({ ...s, rank: board[s.id]?.rank ?? null, attempted: board[s.id]?.attempted ?? 0, correct: board[s.id]?.correct ?? 0, accuracy: board[s.id]?.accuracy ?? 0 })))
-})
+api.get('/students', wrap(async (_req, res) => {
+  const board = Object.fromEntries((await leaderboard()).map((r) => [r.id, r]))
+  const students = await all('SELECT id, phone, name, premium, trials_used, created_at, last_seen FROM students ORDER BY id DESC LIMIT 500')
+  res.json(students.map((s) => ({ ...s, rank: board[s.id]?.rank ?? null, attempted: board[s.id]?.attempted ?? 0, correct: board[s.id]?.correct ?? 0, accuracy: board[s.id]?.accuracy ?? 0 })))
+}))
 
 /* ---------- question bank ---------- */
-api.get('/courses', (_req, res) => {
-  res.json(all(`SELECT c.*,
+api.get('/courses', wrap(async (_req, res) => {
+  const rows = await all(`
+    SELECT c.id, c.name, c.description, c.created_at,
       (SELECT COUNT(*) FROM topics t WHERE t.course_id = c.id) topic_count,
       (SELECT COUNT(*) FROM questions q JOIN topics t ON t.id = q.topic_id WHERE t.course_id = c.id) question_count
-    FROM courses c ORDER BY c.name`))
-})
-api.post('/courses', (req, res) => {
+    FROM courses c ORDER BY c.name`)
+  res.json(rows)
+}))
+api.post('/courses', wrap(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return bad(res, 'Course name is required')
-  const r = run('INSERT INTO courses(name, description) VALUES (?, ?)', name, String(req.body?.description || '').trim())
-  res.status(201).json(get('SELECT * FROM courses WHERE id = ?', r.lastInsertRowid))
-})
-api.put('/courses/:id', (req, res) => {
+  const c = await get(`INSERT INTO courses(name, description) VALUES ($1, $2) RETURNING *`, name, String(req.body?.description || '').trim())
+  res.status(201).json(c)
+}))
+api.put('/courses/:id', wrap(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return bad(res, 'Course name is required')
-  run('UPDATE courses SET name = ?, description = ? WHERE id = ?', name, String(req.body?.description || '').trim(), Number(req.params.id))
-  res.json(get('SELECT * FROM courses WHERE id = ?', Number(req.params.id)))
-})
-api.delete('/courses/:id', (req, res) => {
-  const files = all('SELECT q.document_file f FROM questions q JOIN topics t ON t.id = q.topic_id WHERE t.course_id = ?', Number(req.params.id))
-  run('DELETE FROM courses WHERE id = ?', Number(req.params.id))
+  const c = await get(`UPDATE courses SET name = $1, description = $2 WHERE id = $3 RETURNING *`, name, String(req.body?.description || '').trim(), req.params.id)
+  res.json(c)
+}))
+api.delete('/courses/:id', wrap(async (req, res) => {
+  const files = await all('SELECT q.document_file f FROM questions q JOIN topics t ON t.id = q.topic_id WHERE t.course_id = $1', req.params.id)
+  await run('DELETE FROM courses WHERE id = $1', req.params.id)
   files.forEach((r) => rmFile(r.f))
   res.json({ ok: true })
-})
+}))
 
-api.get('/courses/:id/topics', (req, res) => {
-  res.json(all('SELECT t.*, (SELECT COUNT(*) FROM questions q WHERE q.topic_id = t.id) question_count FROM topics t WHERE t.course_id = ? ORDER BY t.name', Number(req.params.id)))
-})
-api.post('/courses/:id/topics', (req, res) => {
+api.get('/courses/:id/topics', wrap(async (req, res) => {
+  const topics = await all(`SELECT t.*, (SELECT COUNT(*) FROM questions q WHERE q.topic_id = t.id) question_count
+    FROM topics t WHERE t.course_id = $1 ORDER BY t.name`, req.params.id)
+  res.json(topics)
+}))
+api.post('/courses/:id/topics', wrap(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return bad(res, 'Sub topic name is required')
-  if (!get('SELECT 1 x FROM courses WHERE id = ?', Number(req.params.id))) return res.status(404).json({ error: 'Course not found' })
-  const r = run('INSERT INTO topics(course_id, name) VALUES (?, ?)', Number(req.params.id), name)
-  res.status(201).json(get('SELECT * FROM topics WHERE id = ?', r.lastInsertRowid))
-})
-api.put('/topics/:id', (req, res) => {
+  const course = await get('SELECT 1 x FROM courses WHERE id = $1', req.params.id)
+  if (!course) return res.status(404).json({ error: 'Course not found' })
+  const t = await get('INSERT INTO topics(course_id, name) VALUES ($1, $2) RETURNING *', req.params.id, name)
+  res.status(201).json(t)
+}))
+api.put('/topics/:id', wrap(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return bad(res, 'Sub topic name is required')
-  run('UPDATE topics SET name = ? WHERE id = ?', name, Number(req.params.id))
-  res.json(get('SELECT * FROM topics WHERE id = ?', Number(req.params.id)))
-})
-api.delete('/topics/:id', (req, res) => {
-  const files = all('SELECT document_file f FROM questions WHERE topic_id = ?', Number(req.params.id))
-  run('DELETE FROM topics WHERE id = ?', Number(req.params.id))
+  const t = await get('UPDATE topics SET name = $1 WHERE id = $2 RETURNING *', name, req.params.id)
+  res.json(t)
+}))
+api.delete('/topics/:id', wrap(async (req, res) => {
+  const files = await all('SELECT document_file f FROM questions WHERE topic_id = $1', req.params.id)
+  await run('DELETE FROM topics WHERE id = $1', req.params.id)
   files.forEach((r) => rmFile(r.f))
   res.json({ ok: true })
-})
+}))
 
-const shape = (q) => ({ ...q, options: JSON.parse(q.options), document_url: q.document_file ? `/uploads/${q.document_file}` : null })
+const shape = (q) => ({ ...q, options: JSON.parse(q.options || '[]'), document_url: q.document_file ? `/uploads/${q.document_file}` : null })
 
-api.get('/topics/:id/questions', (req, res) => {
-  res.json(all('SELECT * FROM questions WHERE topic_id = ? ORDER BY id', Number(req.params.id)).map(shape))
-})
+api.get('/topics/:id/questions', wrap(async (req, res) => {
+  const questions = await all('SELECT * FROM questions WHERE topic_id = $1 ORDER BY created_at', req.params.id)
+  res.json(questions.map(shape))
+}))
 
 function readQuestion(req) {
   const text = String(req.body?.text || '').trim()
@@ -205,19 +301,61 @@ function readQuestion(req) {
   return { text, options, correct, explanation: String(req.body?.explanation || '').trim() }
 }
 
-api.post('/topics/:id/questions', upload.single('document'), (req, res) => {
+function readBulkQuestions(text) {
+  const lines = String(text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  const questions = []
+  const errors = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const parts = line.split('|').map((p) => p.trim())
+    if (parts.length < 4) { errors.push(`Line ${i + 1}: expected text|optA|optB|optC|correctIndex|explanation`); continue }
+    const qText = parts[0]
+    const correctIndex = Number(parts[parts.length - 2])
+    const explanation = parts[parts.length - 1]
+    const optionList = parts.slice(1, -2)
+    if (optionList.length < 2) { errors.push(`Line ${i + 1}: needs at least 2 options`); continue }
+    if (!Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex >= optionList.length) { errors.push(`Line ${i + 1}: invalid correct index`); continue }
+    questions.push({ text: qText, options: optionList, correct: correctIndex, explanation: explanation || '' })
+  }
+  return { questions, errors }
+}
+
+api.post('/topics/:id/questions', upload.single('document'), wrap(async (req, res) => {
   const q = readQuestion(req)
   if (q.error) { if (req.file) rmFile(req.file.filename); return bad(res, q.error) }
-  if (!get('SELECT 1 x FROM topics WHERE id = ?', Number(req.params.id))) { if (req.file) rmFile(req.file.filename); return res.status(404).json({ error: 'Sub topic not found' }) }
+  const topic = await get('SELECT 1 x FROM topics WHERE id = $1', req.params.id)
+  if (!topic) { if (req.file) rmFile(req.file.filename); return res.status(404).json({ error: 'Sub topic not found' }) }
   const f = req.file
-  const r = run(`INSERT INTO questions(topic_id, text, options, correct, explanation, document_file, document_name, document_mime)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, Number(req.params.id), q.text, JSON.stringify(q.options), q.correct, q.explanation, f?.filename ?? null, f?.originalname ?? null, f?.mimetype ?? null)
-  res.status(201).json(shape(get('SELECT * FROM questions WHERE id = ?', r.lastInsertRowid)))
-})
+  const r = await get(`INSERT INTO questions(topic_id, text, options, correct, explanation, document_file, document_name, document_mime)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+    req.params.id, q.text, JSON.stringify(q.options), q.correct, q.explanation, f?.filename ?? null, f?.originalname ?? null, f?.mimetype ?? null)
+  res.status(201).json(shape(r))
+}))
 
-api.put('/questions/:id', upload.single('document'), (req, res) => {
-  const id = Number(req.params.id)
-  const existing = get('SELECT * FROM questions WHERE id = ?', id)
+api.post('/topics/:id/questions/bulk', wrap(async (req, res) => {
+  const topic = await get('SELECT 1 x FROM topics WHERE id = $1', req.params.id)
+  if (!topic) return res.status(404).json({ error: 'Sub topic not found' })
+  const { text } = req.body || {}
+  if (!text) return bad(res, 'Paste your questions to import')
+  const MAX = 2000
+  const { questions, errors } = readBulkQuestions(text)
+  if (errors.length) return bad(res, `Import errors: ${errors.slice(0, 10).join('; ')}`)
+  if (questions.length === 0) return bad(res, 'No valid questions found')
+  if (questions.length > MAX) return bad(res, `You can import at most ${MAX} questions at once`)
+  const existing = await get('SELECT COUNT(*) c FROM questions WHERE topic_id = $1', req.params.id)
+  if (Number(existing.c) + questions.length > MAX) return bad(res, `This topic would exceed ${MAX} questions (currently ${existing.c})`)
+  const created = []
+  for (const q of questions) {
+    const r = await get(`INSERT INTO questions(topic_id, text, options, correct, explanation)
+      VALUES ($1, $2, $3, $4, $5) RETURNING *`, req.params.id, q.text, JSON.stringify(q.options), q.correct, q.explanation)
+    created.push(shape(r))
+  }
+  res.status(201).json({ imported: created.length, questions: created })
+}))
+
+api.put('/questions/:id', upload.single('document'), wrap(async (req, res) => {
+  const id = req.params.id
+  const existing = await get('SELECT * FROM questions WHERE id = $1', id)
   const q = readQuestion(req)
   if (!existing) { if (req.file) rmFile(req.file.filename); return res.status(404).json({ error: 'Not found' }) }
   if (q.error) { if (req.file) rmFile(req.file.filename); return bad(res, q.error) }
@@ -227,14 +365,14 @@ api.put('/questions/:id', upload.single('document'), (req, res) => {
     file = name = mime = null
   }
   if (req.file) ({ filename: file, originalname: name, mimetype: mime } = req.file)
-  run('UPDATE questions SET text=?, options=?, correct=?, explanation=?, document_file=?, document_name=?, document_mime=? WHERE id=?',
+  const r = await get(`UPDATE questions SET text=$1, options=$2, correct=$3, explanation=$4, document_file=$5, document_name=$6, document_mime=$7 WHERE id=$8 RETURNING *`,
     q.text, JSON.stringify(q.options), q.correct, q.explanation, file, name, mime, id)
-  res.json(shape(get('SELECT * FROM questions WHERE id = ?', id)))
-})
+  res.json(shape(r))
+}))
 
-api.delete('/questions/:id', (req, res) => {
-  const q = get('SELECT document_file FROM questions WHERE id = ?', Number(req.params.id))
-  run('DELETE FROM questions WHERE id = ?', Number(req.params.id))
+api.delete('/questions/:id', wrap(async (req, res) => {
+  const q = await get('SELECT document_file FROM questions WHERE id = $1', req.params.id)
+  await run('DELETE FROM questions WHERE id = $1', req.params.id)
   rmFile(q?.document_file)
   res.json({ ok: true })
-})
+}))

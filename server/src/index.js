@@ -8,6 +8,7 @@ import { UPLOAD_DIR } from './db.js'
 import { ADMIN_PASSWORD } from './auth.js'
 import { api, publicRouter } from './routes.js'
 import { restoreSessions } from './whatsapp/manager.js'
+import { loadSettings } from './db.js'
 
 const app = express()
 app.use(cors({ origin: process.env.CLIENT_ORIGIN || true }))
@@ -43,4 +44,5 @@ app.listen(port, async () => {
     for (const k of ['MARZPAY_API_KEY', 'MARZPAY_API_SECRET', 'MARZPAY_WEBHOOK_SECRET', 'PUBLIC_URL']) if (!process.env[k]) console.warn(`⚠️  ${k} is not set in server/.env - payments won't work until it is`)
   }
   await restoreSessions()
+  await loadSettings()
 })
