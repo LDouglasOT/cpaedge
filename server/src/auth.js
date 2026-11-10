@@ -1,10 +1,10 @@
 import crypto from 'node:crypto'
 import bcrypt from 'bcryptjs'
-import { all, get, run } from './db.js'
+import { prisma } from './db.js'
 
 const SECRET = process.env.AUTH_SECRET || crypto.randomBytes(32).toString('hex')
 const TTL_MS = 1000 * 60 * 60 * 24 * 7
-const DEFAULT_ADMIN_EMAIL = 'admin@local'
+const DEFAULT_ADMIN_PHONE = 'admin@local'
 
 const sign = (payload) => crypto.createHmac('sha256', SECRET).update(payload).digest('hex')
 
@@ -26,10 +26,10 @@ function parseToken(token) {
 
 export const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123'
 
-export async function authenticateAdmin(email, password) {
-  const admin = await get('SELECT * FROM admins WHERE email = $1', email)
+export async function authenticateAdmin(phone, password) {
+  const admin = await prisma.admin.findUnique({ where: { phone } })
   if (!admin || !admin.active) return null
-  const ok = await bcrypt.compare(password, admin.password_hash)
+  const ok = await bcrypt.compare(password, admin.passwordHash)
   return ok ? admin : null
 }
 
@@ -37,19 +37,21 @@ export async function requireAuth(req, res, next) {
   const header = req.headers.authorization || ''
   const adminId = parseToken(header.startsWith('Bearer ') ? header.slice(7) : null)
   if (!adminId) return res.status(401).json({ error: 'Unauthorized' })
-  const admin = await get('SELECT * FROM admins WHERE id = $1', adminId)
+  const admin = await prisma.admin.findUnique({ where: { id: adminId } })
   if (!admin || !admin.active) return res.status(401).json({ error: 'Unauthorized' })
   req.admin = admin
   next()
 }
 
 export async function bootstrapAdmin() {
-  const existing = await get('SELECT * FROM admins LIMIT 1')
+  const existing = await prisma.admin.findFirst()
   if (existing) return existing
   const hash = await bcrypt.hash(ADMIN_PASSWORD, 10)
   const id = crypto.randomBytes(8).toString('hex')
-  await run('INSERT INTO admins(id, email, name, role, password_hash) VALUES ($1, $2, $3, $4, $5)', id, DEFAULT_ADMIN_EMAIL, 'Administrator', 'owner', hash)
-  return { id, email: DEFAULT_ADMIN_EMAIL, name: 'Administrator', role: 'owner' }
+  await prisma.admin.create({
+    data: { id, phone: DEFAULT_ADMIN_PHONE, name: 'Administrator', role: 'owner', passwordHash: hash }
+  })
+  return { id, phone: DEFAULT_ADMIN_PHONE, name: 'Administrator', role: 'owner' }
 }
 
 export async function hashPassword(pw) {

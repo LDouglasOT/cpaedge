@@ -1,4 +1,4 @@
-import { all, get } from './db.js'
+import { prisma } from './db.js'
 import { balance } from './payments.js'
 
 const lastDays = (n) => {
@@ -8,22 +8,35 @@ const lastDays = (n) => {
 }
 
 export async function leaderboard() {
-  const rows = await all(`
-    SELECT s.id, s.name, s.phone,
-           COUNT(DISTINCT a.question_id) AS attempted,
-           COUNT(DISTINCT CASE WHEN a.is_correct = true THEN a.question_id END) AS correct,
-           COUNT(a.id) AS total_attempts,
-           COALESCE(SUM(CASE WHEN a.is_correct = true THEN 1 ELSE 0 END), 0) AS correct_attempts
-    FROM students s
-    JOIN attempts a ON a.student_id = s.id
-    GROUP BY s.id`)
-  rows.forEach((r) => {
-    r.attempted = Number(r.attempted)
-    r.correct = Number(r.correct)
-    r.total_attempts = Number(r.total_attempts)
-    r.correct_attempts = Number(r.correct_attempts)
-    r.accuracy = r.total_attempts ? Math.round((r.correct_attempts / r.total_attempts) * 100) : 0
+  const students = await prisma.student.findMany({
+    include: {
+      attempts: {
+        select: { questionId: true, isCorrect: true }
+      }
+    }
   })
+  
+  const rows = students.map((s) => {
+    const attempts = s.attempts
+    const uniqueQuestions = new Set(attempts.map((a) => a.questionId))
+    const correctQuestions = new Set(attempts.filter((a) => a.isCorrect).map((a) => a.questionId))
+    const totalAttempts = attempts.length
+    const correctAttempts = attempts.filter((a) => a.isCorrect).length
+    const attempted = uniqueQuestions.size
+    const correct = correctQuestions.size
+    const accuracy = totalAttempts ? Math.round((correctAttempts / totalAttempts) * 100) : 0
+    return {
+      id: s.id,
+      name: s.name,
+      phone: s.phone,
+      attempted,
+      correct,
+      total_attempts: totalAttempts,
+      correct_attempts: correctAttempts,
+      accuracy
+    }
+  })
+  
   rows.sort((a, b) => b.correct - a.correct || b.accuracy - a.accuracy || b.attempted - a.attempted || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   rows.forEach((r, i) => (r.rank = i + 1))
   return rows
@@ -36,41 +49,75 @@ export async function studentStats(studentId) {
 }
 
 export async function dashboard() {
+  const since = new Date(Date.now() - 30 * 86400000)
+  const days = lastDays(30)
+  const sinceStr = days[0]
+
   const [
     totalQuestions,
     totalCourses,
     studentsCount,
     premiumCount,
-    perfRow,
+    totalAttempts,
+    correctAttempts,
     activeToday,
     byCourseRows,
     studentsByDay,
     revByDayRows,
-    attByDayRows,
+    attemptsByDay,
+    correctByDay,
     studentsBeforeSince,
   ] = await Promise.all([
-    get('SELECT COUNT(*) c FROM questions'),
-    get('SELECT COUNT(*) c FROM courses'),
-    get('SELECT COUNT(*) c FROM students'),
-    get('SELECT COUNT(*) c FROM students WHERE premium = true'),
-    get(`SELECT COUNT(*) AS attempts, COALESCE(SUM(CASE WHEN is_correct = true THEN 1 ELSE 0 END), 0) AS correct FROM attempts`),
-    get("SELECT COUNT(DISTINCT student_id) c FROM attempts WHERE date(created_at) = date('now')"),
-    all(`
-      SELECT c.name, COUNT(a.id) AS attempts, COALESCE(SUM(CASE WHEN a.is_correct = true THEN 1 ELSE 0 END), 0) AS correct
-      FROM courses c
-      LEFT JOIN topics t ON t.course_id = c.id
-      LEFT JOIN questions q ON q.topic_id = t.id
-      LEFT JOIN attempts a ON a.question_id = q.id
-      GROUP BY c.id, c.name
-      ORDER BY attempts DESC
-      LIMIT 8`),
-    all(`SELECT date(created_at) d, COUNT(*) c FROM students WHERE date(created_at) >= $1 GROUP BY d`, lastDays(30)[0]),
-    all(`SELECT date(created_at) d, SUM(amount) s FROM transactions WHERE type='payment' AND status='success' AND date(created_at) >= $1 GROUP BY d`, lastDays(30)[0]),
-    all(`SELECT date(created_at) d, COUNT(*) c, SUM(CASE WHEN is_correct = true THEN 1 ELSE 0 END) AS k FROM attempts WHERE date(created_at) >= $1 GROUP BY d`, lastDays(30)[0]),
-    get("SELECT COUNT(*) c FROM students WHERE date(created_at) < $1", lastDays(30)[0]),
+    prisma.question.count(),
+    prisma.course.count(),
+    prisma.student.count(),
+    prisma.student.count({ where: { premium: true } }),
+    prisma.attempt.count(),
+    prisma.attempt.count({ where: { isCorrect: true } }),
+    prisma.attempt.groupBy({
+      by: ['studentId'],
+      where: { createdAt: { gte: new Date(new Date().setHours(0,0,0,0)) } },
+      _count: { id: true }
+    }).then(r => r.length),
+    prisma.course.findMany({
+      include: {
+        topics: {
+          include: {
+            questions: {
+              include: { attempts: true }
+            }
+          }
+        }
+      }
+    }).then(courses => courses.map(c => ({
+      name: c.name,
+      attempts: c.topics.reduce((sum, t) => sum + t.questions.reduce((s, q) => s + q.attempts.length, 0), 0),
+      correct: c.topics.reduce((sum, t) => sum + t.questions.reduce((s, q) => s + q.attempts.filter(a => a.isCorrect).length, 0), 0)
+    })).sort((a, b) => b.attempts - a.attempts).slice(0, 8)),
+    prisma.student.groupBy({
+      by: ['createdAt'],
+      where: { createdAt: { gte: since } },
+      _count: { id: true }
+    }).then(r => r.map(x => ({ d: x.createdAt.toISOString().slice(0, 10), c: x._count.id }))),
+    prisma.transaction.groupBy({
+      by: ['createdAt'],
+      where: { type: 'payment', status: 'success', createdAt: { gte: since } },
+      _sum: { amount: true }
+    }).then(r => r.map(x => ({ d: x.createdAt.toISOString().slice(0, 10), s: Number(x._sum.amount || 0) }))),
+    prisma.attempt.groupBy({
+      by: ['createdAt'],
+      where: { createdAt: { gte: since } },
+      _count: { id: true }
+    }).then(r => r.map(x => ({ d: x.createdAt.toISOString().slice(0, 10), c: x._count.id }))),
+    prisma.attempt.groupBy({
+      by: ['createdAt'],
+      where: { createdAt: { gte: since }, isCorrect: true },
+      _count: { id: true }
+    }).then(r => r.map(x => ({ d: x.createdAt.toISOString().slice(0, 10), k: x._count.id }))),
+    prisma.student.count({ where: { createdAt: { lt: since } }})
   ])
 
-  const perf = perfRow
+  const perf = { attempts: totalAttempts, correct: correctAttempts }
   const byCourse = byCourseRows.map((r) => ({
     name: r.name,
     attempts: Number(r.attempts),
@@ -78,13 +125,12 @@ export async function dashboard() {
     accuracy: Number(r.attempts) ? Math.round((Number(r.correct) / Number(r.attempts)) * 100) : 0,
   }))
 
-  const days = lastDays(30)
-  const since = days[0]
   const newByDayMap = Object.fromEntries(studentsByDay.map((r) => [r.d, Number(r.c)]))
   const revByDayMap = Object.fromEntries(revByDayRows.map((r) => [r.d, Number(r.s)]))
-  const attByDayMap = Object.fromEntries(attByDayRows.map((r) => [r.d, { c: Number(r.c), k: Number(r.k) }]))
+  const attByDayMap = Object.fromEntries(attemptsByDay.map((r) => [r.d, Number(r.c)]))
+  const correctByDayMap = Object.fromEntries(correctByDay.map((r) => [r.d, Number(r.k)]))
 
-  let running = Number(studentsBeforeSince.c)
+  let running = Number(studentsBeforeSince)
   const growth = days.map((d) => {
     running += newByDayMap[d] || 0
     return { date: d, label: d.slice(5), students: running, newStudents: newByDayMap[d] || 0, revenue: revByDayMap[d] || 0 }
@@ -93,17 +139,19 @@ export async function dashboard() {
   const daily = days.map((d) => ({
     date: d,
     label: d.slice(5),
-    attempts: attByDayMap[d]?.c || 0,
-    accuracy: attByDayMap[d]?.c ? Math.round((attByDayMap[d].k / attByDayMap[d].c) * 100) : null,
+    attempts: attByDayMap[d] || 0,
+    accuracy: attByDayMap[d] ? Math.round((correctByDayMap[d] || 0) / attByDayMap[d] * 100) : null,
   }))
 
-  const recentTransactions = await all(`
-    SELECT t.*, s.name student_name FROM transactions t LEFT JOIN students s ON s.id = t.student_id
-    ORDER BY t.id DESC LIMIT 10`)
+  const recentTransactions = await prisma.transaction.findMany({
+    take: 10,
+    orderBy: { id: 'desc' },
+    include: { student: { select: { name: true } } }
+  }).then(txs => txs.map(t => ({ ...t, student_name: t.student?.name || null })))
 
   const b = await balance()
   return {
-    totals: { totalQuestions: totalQuestions.c, totalCourses: totalCourses.c, students: studentsCount.c, premium: premiumCount.c, activeToday: activeToday.c, ...b },
+    totals: { totalQuestions, totalCourses, students: studentsCount, premium: premiumCount, activeToday, ...b },
     performance: {
       attempts: Number(perf.attempts),
       correct: Number(perf.correct),

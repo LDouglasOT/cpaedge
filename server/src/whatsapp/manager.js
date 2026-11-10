@@ -8,7 +8,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   makeVoidExtrasSocket,
 } from '@sasa-dev/void-baileys'
-import { all, get, run, SESSION_DIR } from '../db.js'
+import { prisma, SESSION_DIR } from '../db.js'
 import { handleMessage, notifyPaid, notifyPaymentFailed } from './bot.js'
 import { setNotifier, setFailNotifier } from '../payments.js'
 
@@ -17,7 +17,7 @@ const authDir = (id) => path.join(SESSION_DIR, id)
 const setStatus = (id, status, extra = {}) => {
   const l = live.get(id)
   if (l) { l.status = status; Object.assign(l, extra) }
-  run('UPDATE wa_sessions SET status = $1, phone = COALESCE($2, phone) WHERE id = $3', status, extra.phone ?? null, id).catch(() => {})
+  prisma.wASession.update({ where: { id }, data: { status, phone: extra.phone ?? undefined } }).catch(() => {})
 }
 
 async function connect(id, { pairPhone } = {}) {
@@ -81,8 +81,8 @@ async function connect(id, { pairPhone } = {}) {
 
 export async function createSession(label, pairPhone) {
   const id = crypto.randomBytes(5).toString('hex')
-  const count = Number((await get('SELECT COUNT(*) c FROM wa_sessions')).c) + 1
-  await run('INSERT INTO wa_sessions(id, label, status) VALUES ($1, $2, $3)', id, label || `Account ${count}`, 'starting')
+  const count = (await prisma.wASession.count()) + 1
+  await prisma.wASession.create({ data: { id, label: label || `Account ${count}`, status: 'starting' } })
   live.set(id, { status: 'starting', qr: null, pairingCode: null, stopped: false })
   await connect(id, { pairPhone })
   return id
@@ -98,25 +98,25 @@ export async function terminateSession(id) {
     live.delete(id)
   }
   fs.rmSync(authDir(id), { recursive: true, force: true })
-  await run('DELETE FROM wa_sessions WHERE id = $1', id).catch(() => {})
+  await prisma.wASession.delete({ where: { id } }).catch(() => {})
 }
 
 export async function reconnectSession(id) {
-  const row = await get('SELECT * FROM wa_sessions WHERE id = $1', id)
+  const row = await prisma.wASession.findUnique({ where: { id } })
   if (!row) return false
   const old = live.get(id)
   if (old) { clearTimeout(old.timer); try { old.sock?.end?.(undefined) } catch {} }
   live.set(id, { status: 'starting', qr: null, pairingCode: null, stopped: false })
-  await run('UPDATE wa_sessions SET status = $1 WHERE id = $2', 'starting', id)
+  await prisma.wASession.update({ where: { id }, data: { status: 'starting' } })
   await connect(id)
   return true
 }
 
 export async function listSessions() {
-  const rows = await all('SELECT * FROM wa_sessions ORDER BY created_at DESC')
+  const rows = await prisma.wASession.findMany({ orderBy: { createdAt: 'desc' } })
   return Promise.all(rows.map(async (r) => {
     const l = live.get(r.id)
-    const studentCount = Number((await get('SELECT COUNT(*) c FROM students WHERE session_id = $1', r.id)).c)
+    const studentCount = await prisma.student.count({ where: { sessionId: r.id } })
     return {
       ...r,
       status: l?.status || r.status,
@@ -128,7 +128,7 @@ export async function listSessions() {
 }
 
 export async function restoreSessions() {
-  for (const r of await all('SELECT * FROM wa_sessions')) {
+  for (const r of await prisma.wASession.findMany()) {
     if (r.status === 'logged_out' || !fs.existsSync(authDir(r.id))) {
       live.set(r.id, { status: r.status === 'connected' ? 'logged_out' : r.status, qr: null, pairingCode: null, stopped: false })
       continue
@@ -138,12 +138,12 @@ export async function restoreSessions() {
   }
 }
 
-const sessionFor = (student) => live.get(student.session_id)?.sock ? live.get(student.session_id) : [...live.values()].find((l) => l.status === 'connected')
+const sessionFor = (student) => live.get(student.sessionId)?.sock ? live.get(student.sessionId) : [...live.values()].find((l) => l.status === 'connected')
 setNotifier(async (student) => {
   const entry = sessionFor(student)
-  if (entry?.sock) await notifyPaid({ sock: entry.sock, x: entry.x, sessionId: student.session_id }, student)
+  if (entry?.sock) await notifyPaid({ sock: entry.sock, x: entry.x, sessionId: student.sessionId }, student)
 })
 setFailNotifier(async (student) => {
   const entry = sessionFor(student)
-  if (entry?.sock) await notifyPaymentFailed({ sock: entry.sock, x: entry.x, sessionId: student.session_id }, student)
+  if (entry?.sock) await notifyPaymentFailed({ sock: entry.sock, x: entry.x, sessionId: student.sessionId }, student)
 })

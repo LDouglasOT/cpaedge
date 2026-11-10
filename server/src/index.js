@@ -41,7 +41,7 @@ app.listen(port, async () => {
   const provider = process.env.PAYMENT_PROVIDER || 'marzpay'
   console.log(`Payment provider: ${provider}`)
   if (provider === 'marzpay') {
-    for (const k of ['MARZPAY_API_KEY', 'MARZPAY_API_SECRET', 'MARZPAY_WEBHOOK_SECRET', 'PUBLIC_URL']) if (!process.env[k]) console.warn(`⚠️  ${k} is not set in server/.env - payments won't work until it is`)
+    for (const k of ['MARZPAY_API_KEY', 'MARZPAY_API_SECRET']) if (!process.env[k]) console.warn(`⚠️  ${k} is not set in server/.env - payments won't work until it is`)
   }
   await restoreSessions()
   await loadSettings()

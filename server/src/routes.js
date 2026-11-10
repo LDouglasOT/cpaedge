@@ -3,10 +3,10 @@ import multer from 'multer'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { all, get, run, allSettings, setSetting, getSetting, loadSettings, UPLOAD_DIR } from './db.js'
+import { prisma, allSettings, setSetting, getSetting, loadSettings, UPLOAD_DIR } from './db.js'
 import { checkPassword, issueToken, requireAuth, requireRole, authenticateAdmin, bootstrapAdmin, hashPassword } from './auth.js'
 import { dashboard, leaderboard, studentStats } from './stats.js'
-import { balance, confirmPayment, failPayment, confirmWithdrawal, failWithdrawal, initiatePayment, initiateWithdrawal } from './payments.js'
+import { balance, confirmPayment, failPayment, confirmWithdrawal, failWithdrawal, initiatePayment, initiateWithdrawal, pollPaymentStatus } from './payments.js'
 import { createSession, listSessions, reconnectSession, terminateSession } from './whatsapp/manager.js'
 
 const upload = multer({
@@ -27,116 +27,97 @@ export const api = express.Router()
 /* ---------- bootstrap + auth (no token) ---------- */
 publicRouter.post('/login', wrap(async (req, res) => {
   await bootstrapAdmin()
-  const email = String(req.body?.email || 'admin@local')
+  const phone = String(req.body?.phone || req.body?.email || 'admin@local')
   const password = String(req.body?.password || '')
-  const admin = await authenticateAdmin(email, password)
+  const admin = await authenticateAdmin(phone, password)
   if (!admin) return res.status(401).json({ error: 'Wrong credentials' })
-  res.json({ token: issueToken(admin.id), admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role } })
-}))
-
-publicRouter.post('/payments/webhook/marzpay', wrap(async (req, res) => {
-  const secret = process.env.MARZPAY_WEBHOOK_SECRET
-  if (!secret) {
-    console.error('[marzpay] webhook rejected: MARZPAY_WEBHOOK_SECRET is not set')
-    return res.sendStatus(503)
-  }
-  const header = String(req.headers['x-marzpay-signature'] || '')
-  const parts = Object.fromEntries(header.split(',').map((kv) => kv.trim().split('=')))
-  const ts = String(req.headers['x-marzpay-timestamp'] || parts.t || '')
-  const expected = crypto.createHmac('sha256', secret).update(`${ts}.${req.rawBody || ''}`).digest('hex')
-  const given = String(parts.v1 || '')
-  const okSig = given.length === expected.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected))
-  const fresh = Math.abs(Date.now() / 1000 - Number(ts)) < 600
-  if (!okSig || !fresh) return res.sendStatus(401)
-
-  const { event_type: event, transaction: t = {} } = req.body || {}
-  const reference = t.reference
-  if (!reference) return res.sendStatus(200)
-
-  const tx = await get('SELECT * FROM transactions WHERE reference = $1', reference)
-  if (!tx) return res.sendStatus(200)
-
-  if (tx.type === 'payment') {
-    if (event === 'collection.completed') {
-      const paid = Number(t.amount?.raw ?? tx.amount)
-      if (paid + 0.01 < tx.amount) console.error(`[marzpay] ${reference}: paid ${paid} but expected ${tx.amount}; left pending for manual review`)
-      else await confirmPayment(reference)
-    } else if (event === 'collection.failed') {
-      await failPayment(reference, 'Payment declined or timed out')
-    }
-  } else if (tx.type === 'withdrawal') {
-    if (event === 'disbursement.completed') {
-      await confirmWithdrawal(reference)
-    } else if (event === 'disbursement.failed' || event === 'disbursement.cancelled') {
-      await failWithdrawal(reference, `Disbursement ${event}`)
-    }
-  }
-  res.sendStatus(200)
+  res.json({ token: issueToken(admin.id), admin: { id: admin.id, phone: admin.phone, name: admin.name, role: admin.role } })
 }))
 
 api.use(requireAuth)
 
 /* ---------- admin management ---------- */
 api.get('/admins', wrap(async (_req, res) => {
-  const admins = await all(`SELECT a.id, a.email, a.name, a.role, a.active, a.created_at, a.updated_at,
-       (SELECT COUNT(*) FROM admin_invites i WHERE i.invited_by_id = a.id) invite_count
-     FROM admins a ORDER BY a.created_at DESC`)
-  res.json(admins)
+  const admins = await prisma.admin.findMany({
+    orderBy: { createdAt: 'desc' },
+    include: {
+      _count: { select: { invites: true } }
+    }
+  })
+  res.json(admins.map(a => ({
+    id: a.id,
+    email: a.email,
+    name: a.name,
+    role: a.role,
+    active: a.active,
+    created_at: a.createdAt,
+    updated_at: a.updatedAt,
+    invite_count: a._count.invited
+  })))
 }))
 
 api.post('/admins/invite', wrap(async (req, res) => {
   const { email, role = 'admin' } = req.body || {}
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) return bad(res, 'Valid email is required')
   if (!['admin', 'owner'].includes(role)) return bad(res, 'Invalid role')
-  const existing = await get('SELECT 1 FROM admins WHERE email = $1', String(email))
+  const existing = await prisma.admin.findUnique({ where: { email: String(email) } })
   if (existing) return bad(res, 'An admin with this email already exists')
   const token = crypto.randomBytes(16).toString('hex')
-  const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7).toISOString()
-  await run(
-    `INSERT INTO admin_invites(id, email, token, role, invited_by_id, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    crypto.randomBytes(8).toString('hex'), String(email), token, role, req.admin.id, expiresAt,
-  )
+  const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7)
+  await prisma.adminInvite.create({
+    data: {
+      id: crypto.randomBytes(8).toString('hex'),
+      email: String(email),
+      token,
+      role,
+      invitedById: req.admin.id,
+      expiresAt
+    }
+  })
   res.status(201).json({ email, role, token, expiresAt, invitedBy: { name: req.admin.name, email: req.admin.email } })
 }))
 
 api.post('/admins/invite/accept', wrap(async (req, res) => {
   const { token, password, name } = req.body || {}
   if (!token || !password || password.length < 8) return bad(res, 'Token and a password (8+ chars) are required')
-  const invite = await get('SELECT * FROM admin_invites WHERE token = $1', token)
+  const invite = await prisma.adminInvite.findUnique({ where: { token } })
   if (!invite || invite.accepted) return res.status(400).json({ error: 'Invalid or already used invitation' })
-  if (new Date(invite.expires_at) < new Date()) return res.status(400).json({ error: 'Invitation has expired' })
+  if (new Date(invite.expiresAt) < new Date()) return res.status(400).json({ error: 'Invitation has expired' })
   const hash = await hashPassword(String(password))
-  await run('BEGIN')
-  try {
-    await run('INSERT INTO admins(id, email, name, role, password_hash) VALUES ($1, $2, $3, $4, $5)', crypto.randomBytes(8).toString('hex'), invite.email, name || null, invite.role, hash)
-    await run('UPDATE admin_invites SET accepted = true WHERE id = $1', invite.id)
-    await run('COMMIT')
-  } catch (e) {
-    await run('ROLLBACK')
-    throw e
-  }
+  await prisma.$transaction(async (tx) => {
+    await tx.admin.create({
+      data: {
+        id: crypto.randomBytes(8).toString('hex'),
+        email: invite.email,
+        name: name || null,
+        role: invite.role,
+        passwordHash: hash
+      }
+    })
+    await tx.adminInvite.update({ where: { id: invite.id }, data: { accepted: true } })
+  })
   res.json({ ok: true })
 }))
 
 api.put('/admins/:id', wrap(async (req, res) => {
   const { role, active, name } = req.body || {}
   if (req.params.id === req.admin.id && active === false) return bad(res, 'You cannot deactivate yourself')
-  const sets = []
-  const params = []
-  let i = 1
-  if (role !== undefined) { if (!['admin', 'owner'].includes(role)) return bad(res, 'Invalid role'); sets.push(`role = $${i++}`); params.push(role) }
-  if (active !== undefined) { sets.push(`active = $${i++}`); params.push(Boolean(active)) }
-  if (name !== undefined) { sets.push(`name = $${i++}`); params.push(name) }
-  if (sets.length === 0) return bad(res, 'Nothing to update')
-  params.push(req.params.id)
-  const admin = await get(`UPDATE admins SET ${sets.join(', ')} WHERE id = $${i} RETURNING id, email, name, role, active`, ...params)
+  const data = {}
+  if (role !== undefined) { if (!['admin', 'owner'].includes(role)) return bad(res, 'Invalid role'); data.role = role }
+  if (active !== undefined) data.active = Boolean(active)
+  if (name !== undefined) data.name = name
+  if (Object.keys(data).length === 0) return bad(res, 'Nothing to update')
+  const admin = await prisma.admin.update({
+    where: { id: req.params.id },
+    data,
+    select: { id: true, email: true, name: true, role: true, active: true }
+  })
   res.json(admin)
 }))
 
 api.delete('/admins/:id', wrap(async (req, res) => {
   if (req.params.id === req.admin.id) return bad(res, 'You cannot delete yourself')
-  await run('DELETE FROM admins WHERE id = $1', req.params.id)
+  await prisma.admin.delete({ where: { id: req.params.id } })
   res.json({ ok: true })
 }))
 
@@ -170,18 +151,19 @@ api.delete('/whatsapp/sessions/:id', wrap(async (req, res) => {
 /* ---------- funds ---------- */
 api.get('/funds', wrap(async (req, res) => {
   const { type, status } = req.query
-  const where = []
-  const params = []
-  let i = 1
-  if (type) { where.push(`type = $${i++}`); params.push(type) }
-  if (status) { where.push(`status = $${i++}`); params.push(status) }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+  const where = {}
+  if (type) where.type = type
+  if (status) where.status = status
   const [transactions, b] = await Promise.all([
-    all(`SELECT t.*, s.name student_name FROM transactions t LEFT JOIN students s ON s.id = t.student_id
-      ${whereSql} ORDER BY t.id DESC LIMIT 500`, ...params),
+    prisma.transaction.findMany({
+      where,
+      orderBy: { id: 'desc' },
+      take: 500,
+      include: { student: { select: { name: true } } }
+    }),
     balance(),
   ])
-  res.json({ ...b, transactions })
+  res.json({ ...b, transactions: transactions.map(t => ({ ...t, student_name: t.student?.name || null })) })
 }))
 
 api.post('/funds/withdraw', wrap(async (req, res) => {
@@ -195,95 +177,265 @@ api.post('/funds/withdraw', wrap(async (req, res) => {
   if (amount > b.available) return bad(res, 'Amount is more than your available balance')
   const reference = `WD-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
   const currency = await getSetting('currency')
-  const tx = await get(`INSERT INTO transactions(phone, type, amount, currency, status, method, note, reference, created_by_id)
-    VALUES ($1, 'withdrawal', $2, $3, 'pending', $4, $5, $6, $7) RETURNING id`,
-    phone, amount, currency, method, note, reference, req.admin.id)
+  const tx = await prisma.transaction.create({
+    data: {
+      phone,
+      type: 'withdrawal',
+      amount,
+      currency,
+      status: 'pending',
+      method,
+      note,
+      reference,
+      createdById: req.admin.id
+    },
+    select: { id: true }
+  })
   try {
     const { providerRef } = await initiateWithdrawal({ amount, phone, method, note, createdById: req.admin.id })
-    await run('UPDATE transactions SET provider_ref = $1 WHERE id = $2', providerRef, tx.id)
+    await prisma.transaction.update({ where: { id: tx.id }, data: { providerRef } })
   } catch (err) {
-    await run('UPDATE transactions SET status = $1, note = $2 WHERE id = $3', 'failed', String(err.message).slice(0, 200), tx.id)
+    await prisma.transaction.update({ where: { id: tx.id }, data: { status: 'failed', note: String(err.message).slice(0, 200) } })
     throw err
   }
   res.status(201).json({ reference, ...(await balance()) })
 }))
 
 api.post('/transactions/:id/resolve', wrap(async (req, res) => {
-  const tx = await get('SELECT * FROM transactions WHERE id = $1', req.params.id)
+  const tx = await prisma.transaction.findUnique({ where: { id: req.params.id } })
   if (!tx) return res.status(404).json({ error: 'Not found' })
   if (tx.status !== 'pending') return bad(res, 'Transaction is not pending')
   const outcome = req.body?.outcome === 'failed' ? 'failed' : 'success'
   if (tx.type === 'payment' && outcome === 'success') await confirmPayment(tx.reference)
   else if (tx.type === 'withdrawal' && outcome === 'success') await confirmWithdrawal(tx.reference)
-  else await run('UPDATE transactions SET status = $1 WHERE id = $2', outcome, tx.id)
+  else await prisma.transaction.update({ where: { id: tx.id }, data: { status: outcome } })
   res.json({ ok: true, ...(await balance()) })
+}))
+
+/* ---------- payment status check (for polling) ---------- */
+api.post('/payments/check-status', wrap(async (req, res) => {
+  const { reference } = req.body || {}
+  if (!reference) return bad(res, 'Reference is required')
+  const result = await pollPaymentStatus(reference)
+  if (!result) return res.status(404).json({ error: 'Transaction not found or not pending' })
+  res.json({ status: result.status, transaction: result.transaction })
 }))
 
 /* ---------- students ---------- */
 api.get('/students', wrap(async (_req, res) => {
   const board = Object.fromEntries((await leaderboard()).map((r) => [r.id, r]))
-  const students = await all('SELECT id, phone, name, premium, trials_used, created_at, last_seen FROM students ORDER BY id DESC LIMIT 500')
+  const students = await prisma.student.findMany({
+    orderBy: { id: 'desc' },
+    take: 500,
+    select: { id: true, phone: true, name: true, premium: true, trialsUsed: true, createdAt: true, lastSeen: true }
+  })
   res.json(students.map((s) => ({ ...s, rank: board[s.id]?.rank ?? null, attempted: board[s.id]?.attempted ?? 0, correct: board[s.id]?.correct ?? 0, accuracy: board[s.id]?.accuracy ?? 0 })))
 }))
 
 /* ---------- question bank ---------- */
 api.get('/courses', wrap(async (_req, res) => {
-  const rows = await all(`
-    SELECT c.id, c.name, c.description, c.created_at,
-      (SELECT COUNT(*) FROM topics t WHERE t.course_id = c.id) topic_count,
-      (SELECT COUNT(*) FROM questions q JOIN topics t ON t.id = q.topic_id WHERE t.course_id = c.id) question_count
-    FROM courses c ORDER BY c.name`)
-  res.json(rows)
+  const courses = await prisma.course.findMany({
+    orderBy: { name: 'asc' },
+    include: {
+      topics: { select: { id: true } },
+      _count: { select: { topics: true } }
+    }
+  })
+  
+  const courseData = await Promise.all(courses.map(async (c) => {
+    const questionCount = await prisma.question.count({
+      where: { topic: { courseId: c.id } }
+    })
+    return {
+      id: c.id,
+      name: c.name,
+      description: c.description,
+      created_at: c.createdAt,
+      topic_count: c._count.topics,
+      question_count: questionCount
+    }
+  }))
+  
+  res.json(courseData)
 }))
+
 api.post('/courses', wrap(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return bad(res, 'Course name is required')
-  const c = await get(`INSERT INTO courses(name, description) VALUES ($1, $2) RETURNING *`, name, String(req.body?.description || '').trim())
+  const c = await prisma.course.create({
+    data: { name, description: String(req.body?.description || '').trim() }
+  })
   res.status(201).json(c)
 }))
+
 api.put('/courses/:id', wrap(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return bad(res, 'Course name is required')
-  const c = await get(`UPDATE courses SET name = $1, description = $2 WHERE id = $3 RETURNING *`, name, String(req.body?.description || '').trim(), req.params.id)
+  const c = await prisma.course.update({
+    where: { id: req.params.id },
+    data: { name, description: String(req.body?.description || '').trim() }
+  })
   res.json(c)
 }))
+
 api.delete('/courses/:id', wrap(async (req, res) => {
-  const files = await all('SELECT q.document_file f FROM questions q JOIN topics t ON t.id = q.topic_id WHERE t.course_id = $1', req.params.id)
-  await run('DELETE FROM courses WHERE id = $1', req.params.id)
-  files.forEach((r) => rmFile(r.f))
+  const questions = await prisma.question.findMany({
+    where: { topic: { courseId: req.params.id } },
+    select: { documentFile: true }
+  })
+  await prisma.course.delete({ where: { id: req.params.id } })
+  questions.forEach((r) => rmFile(r.documentFile))
   res.json({ ok: true })
 }))
 
 api.get('/courses/:id/topics', wrap(async (req, res) => {
-  const topics = await all(`SELECT t.*, (SELECT COUNT(*) FROM questions q WHERE q.topic_id = t.id) question_count
-    FROM topics t WHERE t.course_id = $1 ORDER BY t.name`, req.params.id)
-  res.json(topics)
+  const topics = await prisma.topic.findMany({
+    where: { courseId: req.params.id },
+    orderBy: { name: 'asc' },
+    include: { _count: { select: { questions: true } }, children: { select: { id: true } } }
+  })
+  res.json(topics.map(t => ({ ...t, question_count: t._count.questions, hasChildren: t.children.length > 0 })))
 }))
-api.post('/courses/:id/topics', wrap(async (req, res) => {
+
+api.get('/courses/:id/topics/tree', wrap(async (req, res) => {
+  const topics = await prisma.topic.findMany({
+    where: { courseId: req.params.id },
+    orderBy: { name: 'asc' },
+    include: { 
+      _count: { select: { questions: true } },
+      children: { 
+        orderBy: { name: 'asc' },
+        include: {
+          _count: { select: { questions: true } },
+          children: {
+            orderBy: { name: 'asc' },
+            include: {
+              _count: { select: { questions: true } },
+              children: {
+                orderBy: { name: 'asc' },
+                include: { _count: { select: { questions: true } } }
+              }
+            }
+          }
+        }
+      }
+    }
+  })
+  
+  const buildTree = (list, parentId = null) => 
+    list.filter(t => t.parentId === parentId).map(t => ({
+      ...t,
+      question_count: t._count.questions,
+      children: buildTree(list, t.id)
+    }))
+  
+  res.json(buildTree(topics))
+}))
+
+api.post('/courses/:id/topics', upload.single('headerImage'), wrap(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return bad(res, 'Sub topic name is required')
-  const course = await get('SELECT 1 x FROM courses WHERE id = $1', req.params.id)
+  const course = await prisma.course.findUnique({ where: { id: req.params.id } })
   if (!course) return res.status(404).json({ error: 'Course not found' })
-  const t = await get('INSERT INTO topics(course_id, name) VALUES ($1, $2) RETURNING *', req.params.id, name)
+  const parentId = req.body?.parentId || null
+  if (parentId) {
+    const parent = await prisma.topic.findUnique({ where: { id: parentId } })
+    if (!parent || parent.courseId !== req.params.id) return bad(res, 'Invalid parent topic')
+  }
+  const f = req.file
+  const t = await prisma.topic.create({
+    data: {
+      courseId: req.params.id,
+      name,
+      parentId,
+      headerImage: f?.filename ?? null,
+      headerMime: f?.mimetype ?? null
+    }
+  })
   res.status(201).json(t)
 }))
-api.put('/topics/:id', wrap(async (req, res) => {
+
+api.post('/courses/:id/topics/bulk', wrap(async (req, res) => {
+  const course = await prisma.course.findUnique({ where: { id: req.params.id } })
+  if (!course) return res.status(404).json({ error: 'Course not found' })
+  const { text } = req.body || {}
+  if (!text) return bad(res, 'Paste your topics to import')
+  const lines = String(text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  const topics = []
+  const errors = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const parts = line.split('|').map((p) => p.trim())
+    if (parts.length < 1) { errors.push(`Line ${i + 1}: expected name|parentName|headerImageUrl`); continue }
+    const name = parts[0]
+    const parentName = parts[1] || null
+    if (!name) { errors.push(`Line ${i + 1}: topic name is required`); continue }
+    let parentId = null
+    if (parentName) {
+      const parent = await prisma.topic.findFirst({ where: { courseId: req.params.id, name: parentName } })
+      if (!parent) { errors.push(`Line ${i + 1}: parent topic "${parentName}" not found`); continue }
+      parentId = parent.id
+    }
+    topics.push({ name, parentId })
+  }
+  if (errors.length) return bad(res, `Import errors: ${errors.slice(0, 10).join('; ')}`)
+  if (topics.length === 0) return bad(res, 'No valid topics found')
+  const created = []
+  for (const t of topics) {
+    const r = await prisma.topic.create({
+      data: {
+        courseId: req.params.id,
+        name: t.name,
+        parentId: t.parentId
+      }
+    })
+    created.push(r)
+  }
+  res.status(201).json({ imported: created.length, topics: created })
+}))
+
+api.put('/topics/:id', upload.single('headerImage'), wrap(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return bad(res, 'Sub topic name is required')
-  const t = await get('UPDATE topics SET name = $1 WHERE id = $2 RETURNING *', name, req.params.id)
+  const existing = await prisma.topic.findUnique({ where: { id: req.params.id } })
+  if (!existing) return res.status(404).json({ error: 'Topic not found' })
+  
+  let { headerImage: img, headerMime: mime } = existing
+  if (req.file) {
+    rmFile(img)
+    img = req.file.filename
+    mime = req.file.mimetype
+  } else if (req.body?.remove_header === 'true') {
+    rmFile(img)
+    img = mime = null
+  }
+  
+  const t = await prisma.topic.update({
+    where: { id: req.params.id },
+    data: { name, headerImage: img, headerMime: mime }
+  })
   res.json(t)
 }))
+
 api.delete('/topics/:id', wrap(async (req, res) => {
-  const files = await all('SELECT document_file f FROM questions WHERE topic_id = $1', req.params.id)
-  await run('DELETE FROM topics WHERE id = $1', req.params.id)
-  files.forEach((r) => rmFile(r.f))
+  const questions = await prisma.question.findMany({
+    where: { topicId: req.params.id },
+    select: { documentFile: true }
+  })
+  const topic = await prisma.topic.findUnique({ where: { id: req.params.id }, select: { headerImage: true } })
+  rmFile(topic?.headerImage)
+  await prisma.topic.delete({ where: { id: req.params.id } })
+  questions.forEach((r) => rmFile(r.documentFile))
   res.json({ ok: true })
 }))
 
-const shape = (q) => ({ ...q, options: JSON.parse(q.options || '[]'), document_url: q.document_file ? `/uploads/${q.document_file}` : null })
+const shape = (q) => ({ ...q, options: JSON.parse(q.options || '[]'), document_url: q.documentFile ? `/uploads/${q.documentFile}` : null, header_url: q.headerImage ? `/uploads/${q.headerImage}` : null })
 
 api.get('/topics/:id/questions', wrap(async (req, res) => {
-  const questions = await all('SELECT * FROM questions WHERE topic_id = $1 ORDER BY created_at', req.params.id)
+  const questions = await prisma.question.findMany({
+    where: { topicId: req.params.id },
+    orderBy: { createdAt: 'asc' }
+  })
   res.json(questions.map(shape))
 }))
 
@@ -320,20 +472,40 @@ function readBulkQuestions(text) {
   return { questions, errors }
 }
 
-api.post('/topics/:id/questions', upload.single('document'), wrap(async (req, res) => {
+api.post('/topics/:id/questions', upload.fields([{ name: 'document', maxCount: 1 }, { name: 'headerImage', maxCount: 1 }]), wrap(async (req, res) => {
   const q = readQuestion(req)
-  if (q.error) { if (req.file) rmFile(req.file.filename); return bad(res, q.error) }
-  const topic = await get('SELECT 1 x FROM topics WHERE id = $1', req.params.id)
-  if (!topic) { if (req.file) rmFile(req.file.filename); return res.status(404).json({ error: 'Sub topic not found' }) }
-  const f = req.file
-  const r = await get(`INSERT INTO questions(topic_id, text, options, correct, explanation, document_file, document_name, document_mime)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-    req.params.id, q.text, JSON.stringify(q.options), q.correct, q.explanation, f?.filename ?? null, f?.originalname ?? null, f?.mimetype ?? null)
+  if (q.error) { 
+    if (req.files?.document?.[0]) rmFile(req.files.document[0].filename)
+    if (req.files?.headerImage?.[0]) rmFile(req.files.headerImage[0].filename)
+    return bad(res, q.error) 
+  }
+  const topic = await prisma.topic.findUnique({ where: { id: req.params.id } })
+  if (!topic) { 
+    if (req.files?.document?.[0]) rmFile(req.files.document[0].filename)
+    if (req.files?.headerImage?.[0]) rmFile(req.files.headerImage[0].filename)
+    return res.status(404).json({ error: 'Sub topic not found' }) 
+  }
+  const docFile = req.files?.document?.[0]
+  const headerFile = req.files?.headerImage?.[0]
+  const r = await prisma.question.create({
+    data: {
+      topicId: req.params.id,
+      text: q.text,
+      options: JSON.stringify(q.options),
+      correct: q.correct,
+      explanation: q.explanation,
+      documentFile: docFile?.filename ?? null,
+      documentName: docFile?.originalname ?? null,
+      documentMime: docFile?.mimetype ?? null,
+      headerImage: headerFile?.filename ?? null,
+      headerMime: headerFile?.mimetype ?? null
+    }
+  })
   res.status(201).json(shape(r))
 }))
 
 api.post('/topics/:id/questions/bulk', wrap(async (req, res) => {
-  const topic = await get('SELECT 1 x FROM topics WHERE id = $1', req.params.id)
+  const topic = await prisma.topic.findUnique({ where: { id: req.params.id } })
   if (!topic) return res.status(404).json({ error: 'Sub topic not found' })
   const { text } = req.body || {}
   if (!text) return bad(res, 'Paste your questions to import')
@@ -342,37 +514,70 @@ api.post('/topics/:id/questions/bulk', wrap(async (req, res) => {
   if (errors.length) return bad(res, `Import errors: ${errors.slice(0, 10).join('; ')}`)
   if (questions.length === 0) return bad(res, 'No valid questions found')
   if (questions.length > MAX) return bad(res, `You can import at most ${MAX} questions at once`)
-  const existing = await get('SELECT COUNT(*) c FROM questions WHERE topic_id = $1', req.params.id)
-  if (Number(existing.c) + questions.length > MAX) return bad(res, `This topic would exceed ${MAX} questions (currently ${existing.c})`)
+  const existing = await prisma.question.count({ where: { topicId: req.params.id } })
+  if (existing + questions.length > MAX) return bad(res, `This topic would exceed ${MAX} questions (currently ${existing})`)
   const created = []
   for (const q of questions) {
-    const r = await get(`INSERT INTO questions(topic_id, text, options, correct, explanation)
-      VALUES ($1, $2, $3, $4, $5) RETURNING *`, req.params.id, q.text, JSON.stringify(q.options), q.correct, q.explanation)
+    const r = await prisma.question.create({
+      data: {
+        topicId: req.params.id,
+        text: q.text,
+        options: JSON.stringify(q.options),
+        correct: q.correct,
+        explanation: q.explanation
+      }
+    })
     created.push(shape(r))
   }
   res.status(201).json({ imported: created.length, questions: created })
 }))
 
-api.put('/questions/:id', upload.single('document'), wrap(async (req, res) => {
+api.put('/questions/:id', upload.fields([{ name: 'document', maxCount: 1 }, { name: 'headerImage', maxCount: 1 }]), wrap(async (req, res) => {
   const id = req.params.id
-  const existing = await get('SELECT * FROM questions WHERE id = $1', id)
+  const existing = await prisma.question.findUnique({ where: { id } })
   const q = readQuestion(req)
-  if (!existing) { if (req.file) rmFile(req.file.filename); return res.status(404).json({ error: 'Not found' }) }
-  if (q.error) { if (req.file) rmFile(req.file.filename); return bad(res, q.error) }
-  let { document_file: file, document_name: name, document_mime: mime } = existing
-  if (req.file || req.body?.remove_document === 'true') {
+  if (!existing) { 
+    if (req.files?.document?.[0]) rmFile(req.files.document[0].filename)
+    if (req.files?.headerImage?.[0]) rmFile(req.files.headerImage[0].filename)
+    return res.status(404).json({ error: 'Not found' }) 
+  }
+  if (q.error) { 
+    if (req.files?.document?.[0]) rmFile(req.files.document[0].filename)
+    if (req.files?.headerImage?.[0]) rmFile(req.files.headerImage[0].filename)
+    return bad(res, q.error) 
+  }
+  let { documentFile: file, documentName: name, documentMime: mime, headerImage: hImg, headerMime: hMime } = existing
+  if (req.files?.document?.[0] || req.body?.remove_document === 'true') {
     rmFile(file)
     file = name = mime = null
   }
-  if (req.file) ({ filename: file, originalname: name, mimetype: mime } = req.file)
-  const r = await get(`UPDATE questions SET text=$1, options=$2, correct=$3, explanation=$4, document_file=$5, document_name=$6, document_mime=$7 WHERE id=$8 RETURNING *`,
-    q.text, JSON.stringify(q.options), q.correct, q.explanation, file, name, mime, id)
+  if (req.files?.document?.[0]) ({ filename: file, originalname: name, mimetype: mime } = req.files.document[0])
+  if (req.files?.headerImage?.[0] || req.body?.remove_header === 'true') {
+    rmFile(hImg)
+    hImg = hMime = null
+  }
+  if (req.files?.headerImage?.[0]) ({ filename: hImg, mimetype: hMime } = req.files.headerImage[0])
+  const r = await prisma.question.update({
+    where: { id },
+    data: {
+      text: q.text,
+      options: JSON.stringify(q.options),
+      correct: q.correct,
+      explanation: q.explanation,
+      documentFile: file,
+      documentName: name,
+      documentMime: mime,
+      headerImage: hImg,
+      headerMime: hMime
+    }
+  })
   res.json(shape(r))
 }))
 
 api.delete('/questions/:id', wrap(async (req, res) => {
-  const q = await get('SELECT document_file FROM questions WHERE id = $1', req.params.id)
-  await run('DELETE FROM questions WHERE id = $1', req.params.id)
-  rmFile(q?.document_file)
+  const q = await prisma.question.findUnique({ where: { id: req.params.id }, select: { documentFile: true, headerImage: true } })
+  await prisma.question.delete({ where: { id: req.params.id } })
+  rmFile(q?.documentFile)
+  rmFile(q?.headerImage)
   res.json({ ok: true })
 }))

@@ -8,111 +8,142 @@ datasource db {
 }
 
 model Admin {
-  id           String   @id @default(cuid())
-  email        String   @unique
+  id           String        @id @default(dbgenerated("gen_random_uuid()"))
+  phone        String        @unique(map: "admins_email_key")
   name         String?
-  role         String   @default("admin")
-  passwordHash String
-  active       Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-  invites      AdminInvite[]
+  role         String        @default("admin")
+  passwordHash String        @map("password_hash")
+  active       Boolean       @default(true)
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime      @default(now()) @map("updated_at") @db.Timestamptz(6)
+  invites      AdminInvite[] @relation("AdminInvites")
   transactions Transaction[]
+
+  @@map("admins")
 }
 
 model AdminInvite {
-  id         String   @id @default(cuid())
-  email      String   @unique
-  token      String   @unique
-  role       String   @default("admin")
-  invitedBy  Admin?   @relation(fields: [invitedById], references: [id], onDelete: SetNull)
-  invitedById String?
-  expiresAt  DateTime
-  accepted   Boolean  @default(false)
-  createdAt  DateTime @default(now())
+  id            String   @id @default(dbgenerated("gen_random_uuid()"))
+  phone         String   @unique(map: "admin_invites_email_key")
+  token         String   @unique
+  role          String   @default("admin")
+  invitedBy     Admin?   @relation("AdminInvites", fields: [invitedById], references: [id], onDelete: SetNull)
+  invitedById   String?  @map("invited_by_id")
+  expiresAt     DateTime @map("expires_at") @db.Timestamptz(6)
+  accepted      Boolean  @default(false)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  passwordHash  String?  @map("password_hash")
+
+  @@map("admin_invites")
 }
 
 model Course {
-  id          String   @id @default(cuid())
+  id          String   @id @default(dbgenerated("gen_random_uuid()"))
   name        String
   description String   @default("")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   topics      Topic[]
-  createdAt   DateTime @default(now())
+
+  @@map("courses")
 }
 
 model Topic {
-  id          String   @id @default(cuid())
+  id          String     @id @default(dbgenerated("gen_random_uuid()"))
   name        String
-  courseId    String
-  course      Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  courseId    String     @map("course_id")
+  parentId    String?    @map("parent_id")
+  headerImage String?    @map("header_image")
+  headerMime  String?    @map("header_mime")
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
   questions   Question[]
-  createdAt   DateTime @default(now())
+  children    Topic[]    @relation("TopicHierarchy")
+  parent      Topic?     @relation("TopicHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  course      Course     @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@map("topics")
 }
 
 model Question {
-  id            String   @id @default(cuid())
-  topicId       String
-  topic         Topic    @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  id            String    @id @default(dbgenerated("gen_random_uuid()"))
+  topicId       String    @map("topic_id")
+  topic         Topic     @relation(fields: [topicId], references: [id], onDelete: Cascade)
   text          String
   options       String
   correct       Int
-  explanation   String   @default("")
-  documentFile  String?
-  documentName  String?
-  documentMime  String?
+  explanation   String    @default("")
+  documentFile  String?   @map("document_file")
+  documentName  String?   @map("document_name")
+  documentMime  String?   @map("document_mime")
+  headerImage   String?   @map("header_image")
+  headerMime    String?   @map("header_mime")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   attempts      Attempt[]
-  createdAt     DateTime @default(now())
+
+  @@map("questions")
 }
 
 model Student {
-  id            String   @id @default(cuid())
-  phone         String   @unique
-  name          String   @default("")
-  jid           String?
-  sessionId     String?
-  premium       Boolean  @default(false)
-  premiumSince  DateTime?
-  trialsUsed    Int      @default(0)
-  state         String   @default("{}")
-  createdAt     DateTime @default(now())
-  lastSeen      DateTime @default(now())
-  attempts      Attempt[]
-  transactions  Transaction[]
-  waSessions    WASession[]
+  id           String        @id @default(dbgenerated("gen_random_uuid()"))
+  phone        String        @unique
+  name         String        @default("")
+  jid          String?
+  sessionId    String?       @map("session_id")
+  premium      Boolean       @default(false)
+  premiumSince DateTime?     @map("premium_since") @db.Timestamptz(6)
+  premiumUntil DateTime?     @map("premium_until") @db.Timestamptz(6)
+  trialsUsed   Int           @default(0) @map("trials_used")
+  state        String        @default("{}")
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastSeen     DateTime      @default(now()) @map("last_seen") @db.Timestamptz(6)
+  attempts     Attempt[]
+  transactions Transaction[]
+  waSessions   WASession[]
+
+  @@index([phone], map: "idx_students_phone")
+  @@map("students")
 }
 
 model Attempt {
-  id          String   @id @default(cuid())
-  studentId   String
-  student     Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  questionId  String
-  question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
-  selected    Int
-  isCorrect   Boolean
-  createdAt   DateTime @default(now())
+  id         String   @id @default(dbgenerated("gen_random_uuid()"))
+  studentId  String   @map("student_id")
+  student    Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  questionId String   @map("question_id")
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  selected   Int
+  isCorrect  Boolean  @map("is_correct")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([studentId], map: "idx_attempts_student")
+  @@index([questionId], map: "idx_attempts_question")
+  @@map("attempts")
 }
 
 model Transaction {
-  id           String   @id @default(cuid())
-  studentId    String?
-  student      Student? @relation(fields: [studentId], references: [id], onDelete: SetNull)
-  phone        String?
-  type         String
-  amount       Float
-  currency     String   @default("UGX")
-  status       String   @default("pending")
-  method       String   @default("")
-  reference    String   @unique
-  providerRef  String?
-  note         String   @default("")
-  createdById  String?
-  createdBy    Admin?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
-  createdAt    DateTime @default(now())
+  id          String   @id @default(dbgenerated("gen_random_uuid()"))
+  studentId   String?  @map("student_id")
+  student     Student? @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  phone       String?
+  type        String
+  amount      Float
+  currency    String   @default("UGX")
+  status      String   @default("pending")
+  method      String   @default("")
+  reference   String   @unique
+  providerRef String?  @map("provider_ref")
+  note        String   @default("")
+  createdById String?  @map("created_by_id")
+  createdBy   Admin?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([reference], map: "idx_transactions_reference")
+  @@map("transactions")
 }
 
 model Setting {
   key   String @id
   value String
+
+  @@map("settings")
 }
 
 model WASession {
@@ -120,6 +151,8 @@ model WASession {
   label     String
   phone     String?
   status    String   @default("starting")
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   students  Student[]
+
+  @@map("wa_sessions")
 }

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto'
-import { get, run, getSetting } from './db.js'
+import { prisma, getSetting } from './db.js'
 
 let notifier = async () => {}
 let failNotifier = async () => {}
@@ -22,14 +22,12 @@ const providers = {
     if (!Number.isInteger(amount) || amount < 500 || amount > 10_000_000) {
       throw new Error('MarzPay accepts amounts between 500 and 10,000,000 UGX (whole numbers)')
     }
-    const publicUrl = (process.env.PUBLIC_URL || '').replace(/\/$/, '')
     const form = new FormData()
     form.set('amount', String(amount))
     form.set('phone_number', `+${msisdn}`)
     form.set('country', 'UG')
     form.set('reference', reference)
-    form.set('description', 'Premium access')
-    if (publicUrl) form.set('callback_url', `${publicUrl}/api/payments/webhook/marzpay`)
+    form.set('description', 'Premium access - 1 month subscription')
     const res = await fetch(`${baseUrl()}/collect-money`, {
       method: 'POST',
       headers: { Authorization: `Basic ${Buffer.from(`${key}:${secret}`).toString('base64')}` },
@@ -80,24 +78,94 @@ export function normalizeMsisdn(input) {
   return null
 }
 
+export async function checkMarzPayStatus(providerRef) {
+  const key = process.env.MARZPAY_API_KEY
+  const secret = process.env.MARZPAY_API_SECRET
+  if (!key || !secret) throw new Error('MARZPAY_API_KEY / MARZPAY_API_SECRET are not set')
+  const res = await fetch(`${baseUrl()}/transactions/${providerRef}`, {
+    method: 'GET',
+    headers: { Authorization: `Basic ${Buffer.from(`${key}:${secret}`).toString('base64')}` },
+  })
+  const json = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    throw new Error(`MarzPay status check: ${json.message || res.status}`)
+  }
+  return json.data || json
+}
+
+export async function pollPaymentStatus(reference) {
+  const tx = await prisma.transaction.findFirst({
+    where: { reference, type: 'payment', status: 'pending' },
+    include: { student: true }
+  })
+  if (!tx) return null
+  if (!tx.providerRef) return { status: 'pending', transaction: tx }
+
+  try {
+    const statusData = await checkMarzPayStatus(tx.providerRef)
+    const status = statusData?.status || statusData?.transaction?.status
+    if (status === 'completed' || status === 'success' || status === 'paid') {
+      return { status: 'success', transaction: tx, providerData: statusData }
+    }
+    if (status === 'failed' || status === 'cancelled' || status === 'declined') {
+      return { status: 'failed', transaction: tx, providerData: statusData }
+    }
+    return { status: 'pending', transaction: tx, providerData: statusData }
+  } catch (err) {
+    console.error('[pollPaymentStatus] error:', err.message)
+    return { status: 'error', transaction: tx, error: err.message }
+  }
+}
+
+export async function startPaymentPolling(reference, intervalMs = 10000, maxAttempts = 30) {
+  let attempts = 0
+  const poll = async () => {
+    attempts++
+    const result = await pollPaymentStatus(reference)
+    if (!result) return
+    if (result.status === 'success') {
+      await confirmPayment(reference)
+      return
+    }
+    if (result.status === 'failed') {
+      await failPayment(reference, result.providerData?.message || 'Payment failed or declined')
+      return
+    }
+    if (attempts < maxAttempts) {
+      setTimeout(poll, intervalMs)
+    } else {
+      await failPayment(reference, 'Payment timed out after 5 minutes')
+    }
+  }
+  setTimeout(poll, intervalMs)
+}
+
 export async function initiatePayment({ student, msisdn }) {
   const amount = Number(await getSetting('premium_price'))
   const currency = await getSetting('currency')
   const reference = crypto.randomUUID()
-  await run(
-    `INSERT INTO transactions(student_id, phone, type, amount, currency, status, method, reference)
-     VALUES ($1, $2, 'payment', $3, $4, 'pending', 'mobile_money', $5)`,
-    student.id, msisdn, amount, currency, reference,
-  )
+  await prisma.transaction.create({
+    data: {
+      studentId: student.id,
+      phone: msisdn,
+      type: 'payment',
+      amount,
+      currency,
+      status: 'pending',
+      method: 'mobile_money',
+      reference,
+    }
+  })
   const name = (process.env.PAYMENT_PROVIDER || 'marzpay').toLowerCase()
   const provider = providers[name]
   if (!provider) throw new Error(`Unknown PAYMENT_PROVIDER "${name}"`)
   try {
     const { providerRef } = await provider({ reference, amount, msisdn, student })
-    await run('UPDATE transactions SET provider_ref = $1 WHERE reference = $2', providerRef, reference)
+    await prisma.transaction.update({ where: { reference }, data: { providerRef } })
+    startPaymentPolling(reference)
     return { reference, amount, currency }
   } catch (err) {
-    await run("UPDATE transactions SET status = 'failed', note = $1 WHERE reference = $2", String(err.message).slice(0, 200), reference)
+    await prisma.transaction.update({ where: { reference }, data: { status: 'failed', note: String(err.message).slice(0, 200) } })
     throw err
   }
 }
@@ -105,75 +173,128 @@ export async function initiatePayment({ student, msisdn }) {
 export async function initiateWithdrawal({ amount, phone, method, note, createdById }) {
   const currency = await getSetting('currency')
   const reference = `WD-${crypto.randomUUID()}`
-  await run(
-    `INSERT INTO transactions(phone, type, amount, currency, status, method, note, reference, created_by_id)
-     VALUES ($1, 'withdrawal', $2, $3, 'pending', $4, $5, $6, $7)`,
-    phone, amount, currency, method, note, reference, createdById,
-  )
+  await prisma.transaction.create({
+    data: {
+      phone,
+      type: 'withdrawal',
+      amount,
+      currency,
+      status: 'pending',
+      method,
+      note,
+      reference,
+      createdById,
+    }
+  })
   const name = (process.env.PAYMENT_PROVIDER || 'marzpay').toLowerCase()
   const provider = providers[name === 'marzpay' ? 'marzpayPayout' : 'mock']
   if (!provider) throw new Error(`Unknown PAYMENT_PROVIDER "${name}"`)
   try {
     const { providerRef } = await provider({ reference, amount, msisdn: phone })
-    await run('UPDATE transactions SET provider_ref = $1 WHERE reference = $2', providerRef, reference)
+    await prisma.transaction.update({ where: { reference }, data: { providerRef } })
     return { reference, amount, currency }
   } catch (err) {
-    await run("UPDATE transactions SET status = 'failed', note = $1 WHERE reference = $2", String(err.message).slice(0, 200), reference)
+    await prisma.transaction.update({ where: { reference }, data: { status: 'failed', note: String(err.message).slice(0, 200) } })
     throw err
   }
 }
 
 export async function confirmPayment(reference) {
-  const tx = await get("SELECT * FROM transactions WHERE reference = $1 AND type = 'payment'", reference)
+  const tx = await prisma.transaction.findFirst({
+    where: { reference, type: 'payment' },
+    include: { student: true }
+  })
   if (!tx || tx.status === 'success') return tx
-  await run("UPDATE transactions SET status = 'success' WHERE id = $1", tx.id)
+  await prisma.transaction.update({ where: { id: tx.id }, data: { status: 'success' } })
   if (tx.studentId) {
-    await run("UPDATE students SET premium = true, premium_since = NOW() WHERE id = $1 AND premium = false", tx.studentId)
-    const student = await get('SELECT * FROM students WHERE id = $1', tx.studentId)
+    const premiumUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+    await prisma.student.update({
+      where: { id: tx.studentId },
+      data: { premium: true, premiumSince: new Date(), premiumUntil }
+    })
+    const student = await prisma.student.findUnique({ where: { id: tx.studentId } })
     await notifier(student, tx).catch((e) => console.error('notify failed', e.message))
+    await sendReceipt(student, tx)
   }
-  return get('SELECT * FROM transactions WHERE id = $1', tx.id)
+  return prisma.transaction.findUnique({ where: { id: tx.id } })
+}
+
+async function sendReceipt(student, tx) {
+  if (!student.jid) return
+  try {
+    const { default: WA } = await import('@sasa-dev/void-baileys')
+    const sock = WA.getSocket?.(student.sessionId)
+    if (!sock) return
+    const receipt = `🧾 *Payment Receipt*\n\n` +
+      `Transaction ID: ${tx.reference}\n` +
+      `Amount: ${tx.currency} ${Number(tx.amount).toLocaleString('en-US')}\n` +
+      `Date: ${new Date().toLocaleString()}\n` +
+      `Status: ✅ Completed\n\n` +
+      `🎉 *Premium Activated*\n` +
+      `Duration: 1 Month (30 days)\n` +
+      `Expires: ${new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toLocaleDateString()}\n\n` +
+      `Thank you for subscribing to CPA Edge!`
+    await sock.sendMessage(student.jid, { text: receipt })
+  } catch (err) {
+    console.error('[sendReceipt] failed:', err.message)
+  }
 }
 
 export async function failPayment(reference, note = '') {
-  const tx = await get("SELECT * FROM transactions WHERE reference = $1 AND type = 'payment' AND status = 'pending'", reference)
+  const tx = await prisma.transaction.findFirst({
+    where: { reference, type: 'payment', status: 'pending' },
+    include: { student: true }
+  })
   if (!tx) return
-  await run("UPDATE transactions SET status = 'failed', note = $1 WHERE id = $2", note, tx.id)
-  const student = tx.studentId && await get('SELECT * FROM students WHERE id = $1', tx.studentId)
+  await prisma.transaction.update({ where: { id: tx.id }, data: { status: 'failed', note } })
+  const student = tx.student
   if (student && !student.premium) await failNotifier(student, tx).catch((e) => console.error('notify failed', e.message))
 }
 
 export async function confirmWithdrawal(reference) {
-  const tx = await get("SELECT * FROM transactions WHERE reference = $1 AND type = 'withdrawal'", reference)
+  const tx = await prisma.transaction.findFirst({ where: { reference, type: 'withdrawal' } })
   if (!tx || tx.status === 'success') return tx
-  await run("UPDATE transactions SET status = 'success' WHERE id = $1", tx.id)
-  return get('SELECT * FROM transactions WHERE id = $1', tx.id)
+  await prisma.transaction.update({ where: { id: tx.id }, data: { status: 'success' } })
+  return prisma.transaction.findUnique({ where: { id: tx.id } })
 }
 
 export async function failWithdrawal(reference, note = '') {
-  const tx = await get("SELECT * FROM transactions WHERE reference = $1 AND type = 'withdrawal' AND status = 'pending'", reference)
+  const tx = await prisma.transaction.findFirst({ where: { reference, type: 'withdrawal', status: 'pending' } })
   if (!tx) return
-  await run("UPDATE transactions SET status = 'failed', note = $1 WHERE id = $2", note, tx.id)
+  await prisma.transaction.update({ where: { id: tx.id }, data: { status: 'failed', note } })
 }
 
 export const balance = async () => {
-  const r = await get(`
-    SELECT
-      COALESCE(SUM(CASE WHEN type='payment' AND status='success' THEN amount END), 0) AS revenue,
-      COALESCE(SUM(CASE WHEN type='withdrawal' AND status='success' THEN amount END), 0) AS withdrawn,
-      COALESCE(SUM(CASE WHEN type='withdrawal' AND status='pending' THEN amount END), 0) AS pending_withdrawals,
-      COALESCE(SUM(CASE WHEN type='payment' AND status='pending' THEN amount END), 0) AS pending_payments
-    FROM transactions`)
-  const revenue = Number(r.revenue || 0)
-  const withdrawn = Number(r.withdrawn || 0)
-  const pendingWithdrawals = Number(r.pending_withdrawals || 0)
-  const pendingPayments = Number(r.pending_payments || 0)
+  const [payments, withdrawals, pendingWithdrawals, pendingPayments] = await Promise.all([
+    prisma.transaction.aggregate({
+      where: { type: 'payment', status: 'success' },
+      _sum: { amount: true }
+    }),
+    prisma.transaction.aggregate({
+      where: { type: 'withdrawal', status: 'success' },
+      _sum: { amount: true }
+    }),
+    prisma.transaction.aggregate({
+      where: { type: 'withdrawal', status: 'pending' },
+      _sum: { amount: true }
+    }),
+    prisma.transaction.aggregate({
+      where: { type: 'payment', status: 'pending' },
+      _sum: { amount: true }
+    })
+  ])
+  
+  const revenue = Number(payments._sum.amount || 0)
+  const withdrawn = Number(withdrawals._sum.amount || 0)
+  const pendingWithdrawalsAmount = Number(pendingWithdrawals._sum.amount || 0)
+  const pendingPaymentsAmount = Number(pendingPayments._sum.amount || 0)
+  
   return {
     revenue,
     withdrawn,
-    pending_withdrawals: pendingWithdrawals,
-    pending_payments: pendingPayments,
-    available: revenue - withdrawn - pendingWithdrawals,
-    counts: { payments: pendingPayments },
+    pending_withdrawals: pendingWithdrawalsAmount,
+    pending_payments: pendingPaymentsAmount,
+    available: revenue - withdrawn - pendingWithdrawalsAmount,
+    counts: { payments: pendingPaymentsAmount },
   }
 }

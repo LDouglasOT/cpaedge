@@ -15,7 +15,7 @@ const TABS = [
 ]
 
 function Login({ onDone }) {
-  const [email, setEmail] = useState('admin@local')
+  const [phone, setPhone] = useState('admin@local')
   const [pw, setPw] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -23,7 +23,7 @@ function Login({ onDone }) {
     e.preventDefault()
     setBusy(true); setErr('')
     try {
-      const { token } = await api('/login', { method: 'POST', body: { email, password: pw } })
+      const { token } = await api('/login', { method: 'POST', body: { phone, password: pw } })
       setToken(token); onDone()
     } catch (e2) { setErr(e2.message) } finally { setBusy(false) }
   }
@@ -31,7 +31,7 @@ function Login({ onDone }) {
     <div className="login">
       <form className="card" onSubmit={submit}>
         <div className="brand" style={{ padding: 0 }}><i /> CPA Edge Admin</div>
-        <label className="f"><span>Email</span><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></label>
+        <label className="f"><span>Phone / Email</span><input type="text" value={phone} onChange={(e) => setPhone(e.target.value)} /></label>
         <label className="f"><span>Password</span><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} autoFocus /></label>
         {err && <div className="err">{err}</div>}
         <button className="btn primary" disabled={busy || !pw}>{busy ? 'Signing in…' : 'Sign in'}</button>
