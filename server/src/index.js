@@ -4,18 +4,14 @@ import cors from 'cors'
 import path from 'node:path'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { UPLOAD_DIR } from './db.js'
-import { ADMIN_PASSWORD } from './auth.js'
 import { api, publicRouter } from './routes.js'
 import { restoreSessions } from './whatsapp/manager.js'
 import { loadSettings } from './db.js'
+import { ADMIN_PASSWORD } from './auth.js'
 
 const app = express()
 app.use(cors({ origin: process.env.CLIENT_ORIGIN || true }))
 app.use(express.json({ limit: '1mb', verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8') } }))
-
-// Uploaded question documents. File names are random, so links are unguessable.
-app.use('/uploads', express.static(UPLOAD_DIR, { index: false, dotfiles: 'deny' }))
 
 app.use('/api', publicRouter)
 app.use('/api', api)
@@ -24,7 +20,7 @@ app.use('/api', api)
 const dist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../client/dist')
 if (fs.existsSync(dist)) {
   app.use(express.static(dist))
-  app.get(/^\/(?!api|uploads).*/, (_req, res) => res.sendFile(path.join(dist, 'index.html')))
+  app.get(/^\/(?!api).*/, (_req, res) => res.sendFile(path.join(dist, 'index.html')))
 }
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }))

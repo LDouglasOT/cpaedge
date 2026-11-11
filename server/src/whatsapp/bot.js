@@ -1,12 +1,44 @@
-import fs from 'node:fs'
 import path from 'node:path'
-import { prisma, getSetting, UPLOAD_DIR } from '../db.js'
+import { fileURLToPath } from 'node:url'
+import dotenv from 'dotenv'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+dotenv.config({ path: path.resolve(__dirname, '../../.env') })
+
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
+import { prisma, getSetting } from '../db.js'
 import { initiatePayment, normalizeMsisdn } from '../payments.js'
 import { studentStats } from '../stats.js'
 
 const PAGE = 9
 const LETTERS = ['A', 'B', 'C']
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
+
+const BUCKET = 'uploads'
+
+let s3Client = null
+function getS3Client() {
+  if (!s3Client) {
+    s3Client = new S3Client({
+      region: 'us-east-2',
+      endpoint: 'https://br-odd-fog-bd2gd6jh.storage.c-8.us-east-2.aws.neon.tech',
+      credentials: {
+        accessKeyId: 'nak_live_e25ccdca30e14da8a7c2f8e0a04ccf08',
+        secretAccessKey: 'nsk_live_ef0b31c3a90ed11f79c971c33b0c5a53a20256d07628891cd995cd6dfd148ca6'
+      },
+      forcePathStyle: true
+    })
+  }
+  return s3Client
+}
+
+async function fetchFromS3(key) {
+  if (!key) return null
+  const cmd = new GetObjectCommand({ Bucket: BUCKET, Key: key })
+  const result = await getS3Client().send(cmd).catch(() => null)
+  if (!result?.Body) return null
+  return Buffer.from(await result.Body.transformToByteArray())
+}
 
 /* ---------- inbound parsing ---------- */
 
@@ -68,6 +100,12 @@ const botName = async () => String(await getSetting('bot_name'))
 
 const text = (ctx, jid, body) => ctx.sock.sendMessage(jid, { text: body })
 
+/* Send typing indicator immediately so user knows bot is alive */
+const sendTyping = (ctx, jid) => ctx.sock.sendPresenceUpdate('composing', jid)
+
+/* Mark message as seen (blue ticks) */
+const markSeen = (ctx, msg) => ctx.sock.sendPresenceUpdate('read', msg.key.remoteJid, msg.key.id, msg.key.fromMe ? 'sender' : 'recipient')
+
 async function buttons(ctx, jid, body, list, footer) {
   try {
     await ctx.x.sendButton(jid, { text: body, footer, buttons: list.map((b) => ({ id: b.id, text: clip(b.text, 20) })) })
@@ -93,11 +131,11 @@ async function pagedList(ctx, jid, { title, body, button, items, prefix, page, m
 
 async function sendHeaderImage(ctx, jid, topic) {
   if (!topic?.headerImage) return
-  const file = path.join(UPLOAD_DIR, topic.headerImage)
-  if (fs.existsSync(file)) {
+  const buffer = await fetchFromS3(topic.headerImage)
+  if (buffer) {
     const mime = topic.headerMime || 'image/jpeg'
     try {
-      await ctx.sock.sendMessage(jid, { image: fs.readFileSync(file), mimetype: mime, caption: `*${topic.name}*` })
+      await ctx.sock.sendMessage(jid, { image: buffer, mimetype: mime, caption: `*${topic.name}*` })
     } catch (e) {
       console.error('[bot] header image send failed:', e.message)
     }
@@ -153,7 +191,8 @@ async function showMenu(ctx, s, jid, { greet = false, page = 0 } = {}) {
         fullDescription: `${qn} question${qn === 1 ? '' : 's'}${c.description ? ' · ' + c.description : ''}` 
       }
     })
-    .filter((c) => c.qn > 0)
+    // Show all levels, even empty ones
+    .filter((c) => true)
   
   await setState(s, {})
   if (greet) {
@@ -163,11 +202,11 @@ async function showMenu(ctx, s, jid, { greet = false, page = 0 } = {}) {
     .replaceAll('{trials}', String(await trialLimit()));
     await text(ctx, jid, `Hello${name ? ' ' + name : ''} 👋\n\n${welcome}`)
   }
-  if (!coursesWithCount.length) return text(ctx, jid, 'No courses are available yet. Please check back soon.')
+  if (!coursesWithCount.length) return text(ctx, jid, 'No levels are available yet. Please check back soon.')
   const status = s.premium ? '⭐ Premium — unlimited practice' : `🎁 Free trial: ${Math.max(0, await trialLimit() - s.trialsUsed)} of ${await trialLimit()} questions left`
   await pagedList(ctx, jid, {
-    title: 'Courses', body: `Select a course to attempt.\n${status}\n\nType *rank* any time to see your ranking.`,
-    button: 'Choose course', items: coursesWithCount.map(c => ({ id: c.id, title: c.name, description: c.fullDescription })), prefix: 'course', page, moreId: 'courses',
+    title: 'Levels', body: `Choose what applies to you.\n${status}\n\nType *rank* any time to see your ranking.`,
+    button: 'Select an option', items: coursesWithCount.map(c => ({ id: c.id, title: c.name, description: c.fullDescription })), prefix: 'course', page, moreId: 'courses',
   })
 }
 
@@ -182,27 +221,59 @@ async function showTopics(ctx, s, jid, courseId, parentId = null, page = 0) {
   })
   
   const tree = buildTopicTree(allTopics, parentId)
-  const flat = flattenTopics(tree).filter(t => t.qn > 0)
   
   const parentTopic = parentId ? await prisma.topic.findUnique({ where: { id: parentId } }) : null
   const title = parentTopic ? parentTopic.name : course.name
   const backId = parentTopic ? `topic_parent:${parentTopic.parentId}:${parentTopic.courseId}` : 'menu'
-  const backLabel = parentTopic ? `⬅️ ${parentTopic.name}` : '⬅️ All courses'
+  const backLabel = parentTopic ? `⬅️ ${parentTopic.name}` : '⬅️ All levels'
   
   // Send header image if this is a parent topic view
   if (parentTopic && parentTopic.headerImage) {
     await sendHeaderImage(ctx, jid, parentTopic)
   }
   
-  if (!flat.length) { 
-    await text(ctx, jid, `*${title}* has no questions yet.${parentTopic ? ' Try a sub-topic.' : ''}`); 
+  if (!tree.length) { 
+    await text(ctx, jid, `*${title}* has no submenus yet.`); 
     return parentTopic ? showTopics(ctx, s, jid, courseId, parentTopic.parentId) : showMenu(ctx, s, jid) 
   }
   
   await setState(s, { courseId, parentTopicId: parentId })
+  
+  // Build items: show children as submenus (navigable) or as topics with questions (leaf)
+  const items = tree.map(t => {
+    const hasChildren = t.children && t.children.length > 0
+    const hasQuestions = t.qn > 0
+    
+    if (hasChildren) {
+      // This is a parent topic - navigate into it
+      return {
+        id: t.id,
+        title: t.title,
+        description: `${t.children.length} submenu${t.children.length === 1 ? '' : 's'}${hasQuestions ? ` · ${t.qn} question${t.qn === 1 ? '' : 's'}` : ''}`,
+        isParent: true
+      }
+    } else if (hasQuestions) {
+      // Leaf topic with questions - select to practice
+      return {
+        id: t.id,
+        title: t.title,
+        description: `${t.qn} question${t.qn === 1 ? '' : 's'}`,
+        isParent: false
+      }
+    } else {
+      // Empty leaf topic
+      return {
+        id: t.id,
+        title: t.title,
+        description: 'No questions yet',
+        isParent: false
+      }
+    }
+  })
+  
   await pagedList(ctx, jid, {
-    title: clip(title, 24), body: `*${title}*\nChoose a topic to practise.`, button: 'Choose topic',
-    items: flat.map(t => ({ ...t, title: '  '.repeat(t.depth) + t.title, description: `${t.qn} question${t.qn === 1 ? '' : 's'}` })),
+    title: clip(title, 24), body: `*${title}*\nChoose what applies to you.`, button: 'Select an option',
+    items: items.map(i => ({ id: i.id, title: i.title, description: i.description })),
     prefix: 'topic', page, moreId: `topics:${courseId}:${parentId || 'root'}`,
     extraRows: [{ title: backLabel, description: 'Go back', rowId: backId }],
   })
@@ -246,11 +317,11 @@ async function serveQuestion(ctx, s, jid, q, { completed = false } = {}) {
 
   // Send question header image if present
   if (q.headerImage) {
-    const file = path.join(UPLOAD_DIR, q.headerImage)
-    if (fs.existsSync(file)) {
+    const buffer = await fetchFromS3(q.headerImage)
+    if (buffer) {
       const mime = q.headerMime || 'image/jpeg'
       try {
-        await ctx.sock.sendMessage(jid, { image: fs.readFileSync(file), mimetype: mime, caption: `*${topic.name}*` })
+        await ctx.sock.sendMessage(jid, { image: buffer, mimetype: mime, caption: `*${topic.name}*` })
       } catch (e) {
         console.error('[bot] question header image send failed:', e.message)
       }
@@ -258,19 +329,19 @@ async function serveQuestion(ctx, s, jid, q, { completed = false } = {}) {
   }
 
   if (q.documentFile) {
-    const file = path.join(UPLOAD_DIR, q.documentFile)
-    if (fs.existsSync(file)) {
+    const buffer = await fetchFromS3(q.documentFile)
+    if (buffer) {
       const mime = q.documentMime || 'application/octet-stream'
       const content = mime.startsWith('image/')
-        ? { image: fs.readFileSync(file), caption: q.documentName || '' }
-        : { document: fs.readFileSync(file), mimetype: mime, fileName: q.documentName || q.documentFile }
+        ? { image: buffer, caption: q.documentName || '' }
+        : { document: buffer, mimetype: mime, fileName: q.documentName || q.documentFile }
       await ctx.sock.sendMessage(jid, content).catch((e) => console.error('[bot] document send failed:', e.message))
     }
   }
 
   const opts = JSON.parse(q.options || '[]')
   const note = completed ? '🔁 You have answered every question in this topic — cycling through them again.\n\n' : ''
-  const body = `${note}*${topic.name}*\n\n${q.text}\n\n${opts.map((o, i) => `*${LETTERS[i]}.* ${o}`).join('\n')}`
+  const body = `${note}*${topic.name}*\n\n${q.text}`
   const footer = s.premium ? 'Premium' : `Trial ${Math.min(s.trialsUsed + (await hasAttempted(s.id, q.id) ? 0 : 1), await trialLimit())} of ${await trialLimit()}`
   await buttons(ctx, jid, body, opts.map((o, i) => ({ id: `ans:${q.id}:${i}`, text: `${LETTERS[i]}. ${o}` })), footer)
 }
@@ -351,6 +422,11 @@ export function handleMessage(ctx, msg) {
 }
 
 async function process(ctx, msg, jid) {
+  /* Immediately show typing indicator so user knows bot is responding */
+  sendTyping(ctx, jid)
+  /* Mark message as seen (blue ticks) */
+  markSeen(ctx, msg)
+
   const input = parseIncoming(msg)
   if (!input) return
   const realJid = msg.key.remoteJidAlt || msg.key.senderPn || jid
@@ -368,8 +444,22 @@ async function process(ctx, msg, jid) {
       case 'courses': return showMenu(ctx, s, jid, { page: Number(a) || 0 })
       case 'course': return showTopics(ctx, s, jid, a)
       case 'topics': return showTopics(ctx, s, jid, a, b || null, Number(c) || 0)
-      case 'topic_parent': return showTopics(ctx, s, jid, c, a || null)
+      case 'topic_parent': return showTopics(ctx, s, jid, b, a || null)
       case 'topic': {
+        // Check if topic has children - if so, navigate into it
+        const topic = await prisma.topic.findUnique({ 
+          where: { id: a }, 
+          include: { _count: { select: { questions: true } } } 
+        })
+        if (!topic) return showMenu(ctx, s, jid)
+        
+        const childrenCount = await prisma.topic.count({ where: { parentId: a } })
+        if (childrenCount > 0) {
+          // Has submenus - navigate into it
+          const course = await prisma.course.findUnique({ where: { id: topic.courseId } })
+          return showTopics(ctx, s, jid, topic.courseId, a)
+        }
+        // Leaf topic - serve questions
         const { q, completed } = await pickQuestion(s, a)
         return serveQuestion(ctx, s, jid, q, { completed })
       }

@@ -4,22 +4,20 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { prisma, allSettings, setSetting, getSetting, loadSettings, UPLOAD_DIR } from './db.js'
+import { uploadToS3, deleteFromS3, getS3Url } from './storage.js'
 import { checkPassword, issueToken, requireAuth, requireRole, authenticateAdmin, bootstrapAdmin, hashPassword } from './auth.js'
 import { dashboard, leaderboard, studentStats } from './stats.js'
 import { balance, confirmPayment, failPayment, confirmWithdrawal, failWithdrawal, initiatePayment, initiateWithdrawal, pollPaymentStatus } from './payments.js'
 import { createSession, listSessions, reconnectSession, terminateSession } from './whatsapp/manager.js'
 
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: UPLOAD_DIR,
-    filename: (_req, file, cb) => cb(null, crypto.randomBytes(12).toString('hex') + path.extname(file.originalname).slice(0, 10)),
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
 })
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
 const bad = (res, msg) => res.status(400).json({ error: msg })
-const rmFile = (name) => name && fs.rmSync(path.join(UPLOAD_DIR, name), { force: true })
+const rmFile = async (name) => { if (name) await deleteFromS3(name) }
 
 export const publicRouter = express.Router()
 export const api = express.Router()
@@ -343,13 +341,15 @@ api.post('/courses/:id/topics', upload.single('headerImage'), wrap(async (req, r
     if (!parent || parent.courseId !== req.params.id) return bad(res, 'Invalid parent topic')
   }
   const f = req.file
+  let headerResult = null
+  if (f) headerResult = await uploadToS3(f)
   const t = await prisma.topic.create({
     data: {
       courseId: req.params.id,
       name,
       parentId,
-      headerImage: f?.filename ?? null,
-      headerMime: f?.mimetype ?? null
+      headerImage: headerResult?.filename ?? null,
+      headerMime: headerResult?.mimetype ?? null
     }
   })
   res.status(201).json(t)
@@ -402,11 +402,12 @@ api.put('/topics/:id', upload.single('headerImage'), wrap(async (req, res) => {
   
   let { headerImage: img, headerMime: mime } = existing
   if (req.file) {
-    rmFile(img)
-    img = req.file.filename
-    mime = req.file.mimetype
+    await rmFile(img)
+    const result = await uploadToS3(req.file)
+    img = result.filename
+    mime = result.mimetype
   } else if (req.body?.remove_header === 'true') {
-    rmFile(img)
+    await rmFile(img)
     img = mime = null
   }
   
@@ -420,16 +421,19 @@ api.put('/topics/:id', upload.single('headerImage'), wrap(async (req, res) => {
 api.delete('/topics/:id', wrap(async (req, res) => {
   const questions = await prisma.question.findMany({
     where: { topicId: req.params.id },
-    select: { documentFile: true }
+    select: { documentFile: true, headerImage: true }
   })
   const topic = await prisma.topic.findUnique({ where: { id: req.params.id }, select: { headerImage: true } })
-  rmFile(topic?.headerImage)
+  await rmFile(topic?.headerImage)
   await prisma.topic.delete({ where: { id: req.params.id } })
-  questions.forEach((r) => rmFile(r.documentFile))
+  for (const r of questions) {
+    await rmFile(r.documentFile)
+    await rmFile(r.headerImage)
+  }
   res.json({ ok: true })
 }))
 
-const shape = (q) => ({ ...q, options: JSON.parse(q.options || '[]'), document_url: q.documentFile ? `/uploads/${q.documentFile}` : null, header_url: q.headerImage ? `/uploads/${q.headerImage}` : null })
+const shape = (q) => ({ ...q, options: JSON.parse(q.options || '[]'), document_url: q.documentFile ? getS3Url(q.documentFile) : null, header_url: q.headerImage ? getS3Url(q.headerImage) : null })
 
 api.get('/topics/:id/questions', wrap(async (req, res) => {
   const questions = await prisma.question.findMany({
@@ -475,18 +479,22 @@ function readBulkQuestions(text) {
 api.post('/topics/:id/questions', upload.fields([{ name: 'document', maxCount: 1 }, { name: 'headerImage', maxCount: 1 }]), wrap(async (req, res) => {
   const q = readQuestion(req)
   if (q.error) { 
-    if (req.files?.document?.[0]) rmFile(req.files.document[0].filename)
-    if (req.files?.headerImage?.[0]) rmFile(req.files.headerImage[0].filename)
+    if (req.files?.document?.[0]) await rmFile(req.files.document[0].filename)
+    if (req.files?.headerImage?.[0]) await rmFile(req.files.headerImage[0].filename)
     return bad(res, q.error) 
   }
   const topic = await prisma.topic.findUnique({ where: { id: req.params.id } })
   if (!topic) { 
-    if (req.files?.document?.[0]) rmFile(req.files.document[0].filename)
-    if (req.files?.headerImage?.[0]) rmFile(req.files.headerImage[0].filename)
+    if (req.files?.document?.[0]) await rmFile(req.files.document[0].filename)
+    if (req.files?.headerImage?.[0]) await rmFile(req.files.headerImage[0].filename)
     return res.status(404).json({ error: 'Sub topic not found' }) 
   }
   const docFile = req.files?.document?.[0]
   const headerFile = req.files?.headerImage?.[0]
+  let docResult = null
+  let headerResult = null
+  if (docFile) docResult = await uploadToS3(docFile)
+  if (headerFile) headerResult = await uploadToS3(headerFile)
   const r = await prisma.question.create({
     data: {
       topicId: req.params.id,
@@ -494,11 +502,11 @@ api.post('/topics/:id/questions', upload.fields([{ name: 'document', maxCount: 1
       options: JSON.stringify(q.options),
       correct: q.correct,
       explanation: q.explanation,
-      documentFile: docFile?.filename ?? null,
-      documentName: docFile?.originalname ?? null,
-      documentMime: docFile?.mimetype ?? null,
-      headerImage: headerFile?.filename ?? null,
-      headerMime: headerFile?.mimetype ?? null
+      documentFile: docResult?.filename ?? null,
+      documentName: docResult?.originalname ?? null,
+      documentMime: docResult?.mimetype ?? null,
+      headerImage: headerResult?.filename ?? null,
+      headerMime: headerResult?.mimetype ?? null
     }
   })
   res.status(201).json(shape(r))
@@ -537,26 +545,35 @@ api.put('/questions/:id', upload.fields([{ name: 'document', maxCount: 1 }, { na
   const existing = await prisma.question.findUnique({ where: { id } })
   const q = readQuestion(req)
   if (!existing) { 
-    if (req.files?.document?.[0]) rmFile(req.files.document[0].filename)
-    if (req.files?.headerImage?.[0]) rmFile(req.files.headerImage[0].filename)
+    if (req.files?.document?.[0]) await rmFile(req.files.document[0].filename)
+    if (req.files?.headerImage?.[0]) await rmFile(req.files.headerImage[0].filename)
     return res.status(404).json({ error: 'Not found' }) 
   }
   if (q.error) { 
-    if (req.files?.document?.[0]) rmFile(req.files.document[0].filename)
-    if (req.files?.headerImage?.[0]) rmFile(req.files.headerImage[0].filename)
+    if (req.files?.document?.[0]) await rmFile(req.files.document[0].filename)
+    if (req.files?.headerImage?.[0]) await rmFile(req.files.headerImage[0].filename)
     return bad(res, q.error) 
   }
   let { documentFile: file, documentName: name, documentMime: mime, headerImage: hImg, headerMime: hMime } = existing
   if (req.files?.document?.[0] || req.body?.remove_document === 'true') {
-    rmFile(file)
+    await rmFile(file)
     file = name = mime = null
   }
-  if (req.files?.document?.[0]) ({ filename: file, originalname: name, mimetype: mime } = req.files.document[0])
+  if (req.files?.document?.[0]) {
+    const result = await uploadToS3(req.files.document[0])
+    file = result.filename
+    name = result.originalname
+    mime = result.mimetype
+  }
   if (req.files?.headerImage?.[0] || req.body?.remove_header === 'true') {
-    rmFile(hImg)
+    await rmFile(hImg)
     hImg = hMime = null
   }
-  if (req.files?.headerImage?.[0]) ({ filename: hImg, mimetype: hMime } = req.files.headerImage[0])
+  if (req.files?.headerImage?.[0]) {
+    const result = await uploadToS3(req.files.headerImage[0])
+    hImg = result.filename
+    hMime = result.mimetype
+  }
   const r = await prisma.question.update({
     where: { id },
     data: {

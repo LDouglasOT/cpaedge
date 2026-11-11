@@ -50,7 +50,7 @@ function TopicModal({ courseId, topic, parentId, onClose, onSaved, topics }) {
   }
 
   return (
-    <Modal title={topic ? 'Edit topic' : parentId ? 'Add sub-topic' : 'Add topic'} onClose={onClose}>
+    <Modal title={topic ? 'Edit topic' : parentId ? 'Add submenu' : 'Add topic'} onClose={onClose}>
       <form className="form" onSubmit={submit}>
         <label className="f"><span>Topic name</span><input type="text" value={name} onChange={(e) => setName(e.target.value)} autoFocus /></label>
         <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Header image <small className="muted" style={{ fontWeight: 400 }}>(shown in WhatsApp menu)</small></span>
@@ -87,16 +87,16 @@ function BulkTopicImportModal({ courseId, onClose, onSaved }) {
   }
 
   return (
-    <Modal title="Bulk import topics & sub-topics" onClose={onClose}>
+    <Modal title="Bulk import topics & submenus" onClose={onClose}>
       <form className="form" onSubmit={submit}>
         <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Paste topics (one per line)</span>
-          <textarea value={text} onChange={(e) => setText(e.target.value)} rows={12} placeholder="Format: Topic Name|Parent Topic Name
+          <textarea value={text} onChange={(e) => setText(e.target.value)} rows={12} placeholder="Format: Topic Name|Parent Menu Name
 Example:
 Financial Accounting
 Cost Accounting|Financial Accounting
 Management Accounting|Financial Accounting
 Taxation|Financial Accounting" />
-          <small className="muted">Format: <code>Topic Name|Parent Topic Name</code> (parent is optional). Sub-topics must reference existing parent topics.</small>
+          <small className="muted">Format: <code>Topic Name|Parent Menu Name</code> (parent is optional). Submenus must reference existing parent topics.</small>
         </div>
         {err && <div className="err">{err}</div>}
         <div className="row" style={{ justifyContent: 'flex-end' }}>
@@ -109,7 +109,7 @@ Taxation|Financial Accounting" />
 }
 
 function QuestionModal({ topicId, question, onClose, onSaved }) {
-  const defaultOptions = ['Option A', 'Option B', 'Option C']
+  const defaultOptions = ['', '', '']
   const [text, setText] = useState(question?.text || '')
   const [options, setOptions] = useState(question?.options || defaultOptions)
   const [correct, setCorrect] = useState(question?.correct ?? 0)
@@ -191,26 +191,26 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
   )
 }
 
-function TopicTree({ topics, onSelect, onAddChild, onEdit, onDelete, selectedId, depth = 0 }) {
+function TopicDropdown({ topics, onSelect, onAddChild, onEdit, onDelete, selectedId, parentId = null, depth = 0 }) {
   if (!topics?.length) return null
   return (
-    <div style={{ marginLeft: depth * 20 }}>
+    <div style={{ marginLeft: depth * 16 }}>
       {topics.map((t) => (
-        <div key={t.id} className={`item ${t.id === selectedId ? 'on' : ''}`} style={{ borderLeft: depth > 0 ? '2px solid var(--border)' : 'none', paddingLeft: depth > 0 ? 8 : 0 }}>
+        <div key={t.id} className={`item ${t.id === selectedId ? 'on' : ''}`}>
           <div className="row between" style={{ alignItems: 'center' }}>
             <div onClick={() => onSelect(t.id)} style={{ cursor: 'pointer', flex: 1 }}>
               <div style={{ fontWeight: t.question_count > 0 ? 600 : 400 }}>
                 {'  '.repeat(depth)}{t.name} {t.headerImage && <span style={{ color: 'var(--primary)' }}>📷</span>}
               </div>
-              <small>{t.question_count} question{t.question_count === 1 ? '' : 's'}{t.hasChildren ? ' · has sub-topics' : ''}</small>
+              <small>{t.question_count} question{t.question_count === 1 ? '' : 's'}{t.children?.length ? ' · has submenus' : ''}</small>
             </div>
             <div className="acts" onClick={(e) => e.stopPropagation()}>
-              <button className="icon" title="Add sub-topic" onClick={() => onAddChild(t.id)}>➕</button>
+              <button className="icon" title="Add submenu" onClick={() => onAddChild(t.id)}>➕</button>
               <button className="icon" title="Edit" onClick={() => onEdit(t)}>✎</button>
               <button className="icon" title="Delete" onClick={() => onDelete(t.id)}>🗑</button>
             </div>
           </div>
-          {t.children?.length && <TopicTree topics={t.children} onSelect={onSelect} onAddChild={onAddChild} onEdit={onEdit} onDelete={onDelete} selectedId={selectedId} depth={depth + 1} />}
+          {t.children?.length && <TopicDropdown topics={t.children} onSelect={onSelect} onAddChild={onAddChild} onEdit={onEdit} onDelete={onDelete} selectedId={selectedId} parentId={t.id} depth={depth + 1} />}
         </div>
       ))}
     </div>
@@ -246,20 +246,20 @@ export default function QuestionBank() {
 
   return (
     <>
-      <div className="head"><div><h1>Question bank</h1><p>Courses, topics, sub-topics and the questions students practise.</p></div></div>
+      <div className="head"><div><h1>Question bank</h1><p>Levels, topics, submenus and the questions students practise.</p></div></div>
       {err && <div className="err" style={{ marginBottom: 12 }}>{err}</div>}
 
       <div className="bank">
-        <div className="card">
-          <div className="row between" style={{ marginBottom: 10 }}><h2>Courses</h2><button className="btn sm primary" onClick={() => setModal({ type: 'course' })}>+ Add</button></div>
-          {!courses.data?.length ? <div className="empty">Add your first course.</div> : (
+<div className="card">
+        <div className="row between" style={{ marginBottom: 10 }}><h2>Levels</h2><button className="btn sm primary" onClick={() => setModal({ type: 'course' })}>+ Add</button></div>
+          {!courses.data?.length ? <div className="empty">Add your first level.</div> : (
             <div className="list">
               {courses.data.map((c) => (
                 <div key={c.id} className={`item ${c.id === courseId ? 'on' : ''}`} onClick={() => setCourseId(c.id)}>
                   <div><div>{c.name}</div><small>{c.topic_count} topics · {c.question_count} questions</small></div>
                   <div className="acts" onClick={(e) => e.stopPropagation()}>
                     <button className="icon" title="Rename" onClick={() => setModal({ type: 'course', item: c })}>✎</button>
-                    <button className="icon" title="Delete" onClick={() => del('course and everything in it', `/courses/${c.id}`, () => setCourseId(null))}>🗑</button>
+                    <button className="icon" title="Delete" onClick={() => del('level and everything in it', `/courses/${c.id}`, () => setCourseId(null))}>🗑</button>
                   </div>
                 </div>
               ))}
@@ -267,8 +267,8 @@ export default function QuestionBank() {
           )}
         </div>
 
-        <div className="card">
-          <div className="row between" style={{ marginBottom: 10 }}><h2>Topics & Sub-topics</h2>
+<div className="card">
+        <div className="row between" style={{ marginBottom: 10 }}><h2>Topics & Submenus</h2>
             <div className="row" style={{ gap: 8 }}>
               <button className="btn sm primary" disabled={!course} onClick={() => setModal({ type: 'topic', parentId: null })}>+ Add topic</button>
               <button className="btn sm" disabled={!course} onClick={() => setModal({ type: 'bulkTopic' })}>Bulk import</button>
@@ -276,7 +276,7 @@ export default function QuestionBank() {
           </div>
           {!course ? <div className="empty">Select a course.</div> : !topicsTree.data?.length ? <div className="empty">No topics in {course.name} yet. Click + Add topic to start.</div> : (
             <div className="list">
-              <TopicTree 
+              <TopicDropdown 
                 topics={topicsTree.data} 
                 onSelect={setTopicId} 
                 onAddChild={(parentId) => setModal({ type: 'topic', parentId })} 
