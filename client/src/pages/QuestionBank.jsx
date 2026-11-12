@@ -27,19 +27,40 @@ function NameModal({ title, label, initial = '', withDescription, initialDescrip
   )
 }
 
-function TopicModal({ courseId, topic, parentId, onClose, onSaved, topics }) {
+function topicPath(id, flat, byId) {
+  const parts = []
+  let cur = byId[id]
+  const seen = new Set()
+  while (cur && !seen.has(cur.id)) {
+    parts.unshift(cur.name)
+    seen.add(cur.id)
+    cur = cur.parentId ? byId[cur.parentId] : null
+  }
+  return parts.join(' › ')
+}
+
+function TopicModal({ courseId, topic, parentId, onClose, onSaved, topics = [] }) {
+  const flat = Array.isArray(topics) ? topics : []
+  const byId = Object.fromEntries(flat.map((t) => [t.id, t]))
+  const initialParent = topic ? (topic.parentId || '') : (parentId || '')
   const [name, setName] = useState(topic?.name || '')
+  const [placement, setPlacement] = useState(initialParent ? 'submenu' : 'topic')
+  const [selectedParent, setSelectedParent] = useState(initialParent)
   const [headerImage, setHeaderImage] = useState(null)
   const [removeHeader, setRemoveHeader] = useState(false)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
+  const parentOptions = flat.filter((t) => !topic || t.id !== topic.id)
+  const effectiveParent = placement === 'submenu' ? selectedParent : ''
+
   const submit = async (e) => {
     e.preventDefault(); setErr('')
     if (!name.trim()) return setErr('Topic name is required')
+    if (placement === 'submenu' && !effectiveParent) return setErr('Select a parent topic/subtopic')
     const form = new FormData()
     form.set('name', name)
-    if (parentId) form.set('parentId', parentId)
+    if (effectiveParent) form.set('parentId', effectiveParent)
     if (headerImage) form.set('headerImage', headerImage)
     if (removeHeader) form.set('remove_header', 'true')
     setBusy(true)
@@ -50,9 +71,31 @@ function TopicModal({ courseId, topic, parentId, onClose, onSaved, topics }) {
   }
 
   return (
-    <Modal title={topic ? 'Edit topic' : parentId ? 'Add submenu' : 'Add topic'} onClose={onClose}>
+    <Modal title={topic ? 'Edit topic' : placement === 'submenu' ? 'Add submenu' : 'Add topic'} onClose={onClose}>
       <form className="form" onSubmit={submit}>
-        <label className="f"><span>Topic name</span><input type="text" value={name} onChange={(e) => setName(e.target.value)} autoFocus /></label>
+        {!topic && (
+          <label className="f"><span>Add as</span>
+            <select value={placement} onChange={(e) => setPlacement(e.target.value)}>
+              <option value="topic">Top-level topic</option>
+              <option value="submenu">Subtopic (under a topic/subtopic)</option>
+            </select>
+          </label>
+        )}
+        {!topic && placement === 'submenu' && (
+          <label className="f"><span>Parent topic/subtopic</span>
+            <select value={selectedParent} onChange={(e) => setSelectedParent(e.target.value)}>
+              <option value="">Select parent…</option>
+              {parentOptions.map((t) => <option key={t.id} value={t.id}>{topicPath(t.id, flat, byId) || t.name}</option>)}
+            </select>
+            {!parentOptions.length && <small className="muted">Create a top-level topic first to add subtopics under it.</small>}
+          </label>
+        )}
+        {topic && (
+          <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Placement</span>
+            <div className="muted" style={{ fontSize: 13 }}>{topic.parentId ? `Subtopic under: ${topicPath(topic.parentId, flat, byId) || 'Parent topic'}` : 'Top-level topic'}</div>
+          </div>
+        )}
+        <label className="f"><span>{placement === 'submenu' && !topic ? 'Subtopic name' : 'Topic name'}</span><input type="text" value={name} onChange={(e) => setName(e.target.value)} autoFocus /></label>
         <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Header image <small className="muted" style={{ fontWeight: 400 }}>(shown in WhatsApp menu)</small></span>
           {topic?.headerImage && !removeHeader && !headerImage && (
             <div className="row"><a href={`/uploads/${topic.headerImage}`} target="_blank" rel="noreferrer">Current image</a>
@@ -64,7 +107,7 @@ function TopicModal({ courseId, topic, parentId, onClose, onSaved, topics }) {
         {err && <div className="err">{err}</div>}
         <div className="row" style={{ justifyContent: 'flex-end' }}>
           <button type="button" className="btn" onClick={onClose}>Cancel</button>
-          <button className="btn primary" disabled={busy || !name.trim()}>{busy ? 'Saving…' : 'Save topic'}</button>
+          <button className="btn primary" disabled={busy || !name.trim() || (placement === 'submenu' && !effectiveParent && !topic)}>{busy ? 'Saving…' : 'Save'}</button>
         </div>
       </form>
     </Modal>
@@ -109,7 +152,13 @@ Taxation|Financial Accounting" />
 }
 
 function QuestionModal({ topicId, question, onClose, onSaved }) {
+  const isLongExisting = question?.type === 'long'
+  const existingQImgs = Array.isArray(question?.question_images) ? question.question_images : []
+  const existingAImgs = Array.isArray(question?.model_answer_images) ? question.model_answer_images : []
   const initialOptions = Array.isArray(question?.options) && question.options.length === 3 ? question.options : ['', '', '']
+
+  const [qType, setQType] = useState(isLongExisting ? 'long' : 'objective')
+  const [isImageQuestion, setIsImageQuestion] = useState(isLongExisting && question?.promptType === 'image' ? 'yes' : 'no')
   const [text, setText] = useState(question?.text || '')
   const [options, setOptions] = useState(initialOptions)
   const [correct, setCorrect] = useState(Number.isInteger(question?.correct) ? question.correct : 0)
@@ -118,22 +167,62 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
   const [removeDoc, setRemoveDoc] = useState(false)
   const [headerImage, setHeaderImage] = useState(null)
   const [removeHeader, setRemoveHeader] = useState(false)
+  const [questionImageCount, setQuestionImageCount] = useState(Math.min(3, Math.max(1, existingQImgs.length || 1)))
+  const [answerImageCount, setAnswerImageCount] = useState(Math.min(3, Math.max(1, existingAImgs.length || 1)))
+  const [questionImages, setQuestionImages] = useState([null, null, null])
+  const [answerImages, setAnswerImages] = useState([null, null, null])
+  const [modelAnswer, setModelAnswer] = useState(question?.modelAnswer || '')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
   const setOpt = (i, v) => setOptions(options.map((o, k) => (k === i ? v : o)))
+  const setQImg = (i, f) => setQuestionImages(questionImages.map((x, k) => (k === i ? f : x)))
+  const setAImg = (i, f) => setAnswerImages(answerImages.map((x, k) => (k === i ? f : x)))
 
   const submit = async (e) => {
     e.preventDefault(); setErr('')
-    const clean = options.map((o) => o.trim())
-    if (clean.some((o) => !o)) return setErr('Fill in all three answers (A, B, C)')
-    if (!(correct >= 0 && correct <= 2)) return setErr('Select the correct answer')
     const form = new FormData()
-    form.set('text', text); form.set('options', JSON.stringify(clean)); form.set('correct', String(correct)); form.set('explanation', explanation)
+    form.set('type', qType)
+    form.set('explanation', explanation)
+
+    if (qType === 'objective') {
+      const clean = options.map((o) => o.trim())
+      if (!text.trim()) return setErr('Question text is required')
+      if (clean.some((o) => !o)) return setErr('Fill in all three answers (A, B, C)')
+      if (!(correct >= 0 && correct <= 2)) return setErr('Select the correct answer')
+      form.set('text', text)
+      form.set('options', JSON.stringify(clean))
+      form.set('correct', String(correct))
+    } else {
+      const imgQ = isImageQuestion === 'yes'
+      form.set('is_image_question', String(imgQ))
+      form.set('text', text)
+      form.set('model_answer', modelAnswer)
+      if (imgQ) {
+        const qc = Math.min(3, Math.max(1, Number(questionImageCount) || 1))
+        const ac = Math.min(3, Math.max(1, Number(answerImageCount) || 1))
+        form.set('question_image_count', String(qc))
+        form.set('answer_image_count', String(ac))
+        for (let i = 0; i < qc; i++) {
+          if (questionImages[i]) form.set(`questionImage${i + 1}`, questionImages[i])
+          else if (!existingQImgs[i]?.file) return setErr(`Upload question image page ${i + 1}`)
+        }
+        for (let i = 0; i < ac; i++) {
+          if (answerImages[i]) form.set(`modelAnswerImage${i + 1}`, answerImages[i])
+          else if (!existingAImgs[i]?.file) return setErr(`Upload answer image page ${i + 1}`)
+        }
+        form.set('keep_questionImages', JSON.stringify(existingQImgs.slice(0, qc).map((x, i) => ({ page: i + 1, file: x.file, mime: x.mime, name: x.name }))))
+        form.set('keep_modelAnswerImages', JSON.stringify(existingAImgs.slice(0, ac).map((x, i) => ({ page: i + 1, file: x.file, mime: x.mime, name: x.name }))))
+      } else {
+        if (!text.trim()) return setErr('Question text is required for long text questions')
+      }
+    }
+
     if (file) form.set('document', file)
     if (removeDoc) form.set('remove_document', 'true')
     if (headerImage) form.set('headerImage', headerImage)
     if (removeHeader) form.set('remove_header', 'true')
+
     setBusy(true)
     try {
       await api(question ? `/questions/${question.id}` : `/topics/${topicId}/questions`, { method: question ? 'PUT' : 'POST', form })
@@ -141,22 +230,97 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
     } catch (e2) { setErr(e2.message); setBusy(false) }
   }
 
+  const imgQ = qType === 'long' && isImageQuestion === 'yes'
+  const qCount = Math.min(3, Math.max(1, Number(questionImageCount) || 1))
+  const aCount = Math.min(3, Math.max(1, Number(answerImageCount) || 1))
+
   return (
     <Modal title={question ? 'Edit question' : 'Add question'} onClose={onClose}>
       <form className="form" onSubmit={submit}>
-        <label className="f"><span>Question</span><textarea value={text} onChange={(e) => setText(e.target.value)} autoFocus rows={4} placeholder="Enter your question here (supports multiple lines)" /></label>
-        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Answers <small className="muted" style={{ fontWeight: 400 }}>� Options A, B, C are fixed. Enter each answer and tick the correct one.</small></span>
-          <div className="form" style={{ gap: 8 }}>
-            {LETTERS.map((letter, i) => (
-              <div className="optrow" key={letter}>
-                <input type="radio" name="correct" checked={correct === i} onChange={() => setCorrect(i)} aria-label={`Option ${letter} is correct`} />
-                <div style={{ fontWeight: 600, width: 18 }}>{letter}.</div>
-                <input type="text" value={options[i] || ''} onChange={(e) => setOpt(i, e.target.value)} placeholder={`Answer ${letter}`} maxLength={200} />
+        <label className="f"><span>Question format</span>
+          <select value={qType} onChange={(e) => setQType(e.target.value)} disabled={!!question}>
+            <option value="objective">Objective</option>
+            <option value="long">Long format</option>
+          </select>
+          {question && <small className="muted">Question format cannot be changed when editing.</small>}
+        </label>
+
+        {qType === 'long' && (
+          <label className="f"><span>Is this an image question?</span>
+            <select value={isImageQuestion} onChange={(e) => setIsImageQuestion(e.target.value)}>
+              <option value="no">No (text long question)</option>
+              <option value="yes">Yes (image question & answer pages)</option>
+            </select>
+          </label>
+        )}
+
+        {qType === 'objective' && (
+          <>
+            <label className="f"><span>Question</span><textarea value={text} onChange={(e) => setText(e.target.value)} autoFocus rows={4} placeholder="Enter your question here (supports multiple lines)" /></label>
+            <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Answers <small className="muted" style={{ fontWeight: 400 }}>— Options A, B, C are fixed. Enter each answer and tick the correct one.</small></span>
+              <div className="form" style={{ gap: 8 }}>
+                {LETTERS.map((letter, i) => (
+                  <div className="optrow" key={letter}>
+                    <input type="radio" name="correct" checked={correct === i} onChange={() => setCorrect(i)} aria-label={`Option ${letter} is correct`} />
+                    <div style={{ fontWeight: 600, width: 18 }}>{letter}.</div>
+                    <input type="text" value={options[i] || ''} onChange={(e) => setOpt(i, e.target.value)} placeholder={`Answer ${letter}`} maxLength={200} />
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        </div>
+            </div>
+          </>
+        )}
+
+        {qType === 'long' && !imgQ && (
+          <>
+            <label className="f"><span>Question (text)</span><textarea value={text} onChange={(e) => setText(e.target.value)} rows={5} placeholder="Enter the long-format question" /></label>
+            <label className="f"><span>Model answer <small className="muted">(used for grading/reference)</small></span><textarea value={modelAnswer} onChange={(e) => setModelAnswer(e.target.value)} rows={5} placeholder="Enter the expected/model answer" /></label>
+          </>
+        )}
+
+        {imgQ && (
+          <>
+            <label className="f"><span>Question title/context <small className="muted">(optional)</small></span><textarea value={text} onChange={(e) => setText(e.target.value)} rows={2} placeholder="Optional text shown with the image question" /></label>
+            <div className="row" style={{ gap: 12, alignItems: 'flex-end' }}>
+              <label className="f" style={{ flex: 1 }}><span>Question pages (images)</span>
+                <select value={qCount} onChange={(e) => setQuestionImageCount(Number(e.target.value))}>
+                  <option value={1}>1 page</option><option value={2}>2 pages</option><option value={3}>3 pages</option>
+                </select>
+              </label>
+              <label className="f" style={{ flex: 1 }}><span>Answer pages (images)</span>
+                <select value={aCount} onChange={(e) => setAnswerImageCount(Number(e.target.value))}>
+                  <option value={1}>1 page</option><option value={2}>2 pages</option><option value={3}>3 pages</option>
+                </select>
+              </label>
+            </div>
+            <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Question image pages <small className="muted">(up to 3)</small></span>
+              <div className="form" style={{ gap: 10 }}>
+                {Array.from({ length: qCount }).map((_, i) => (
+                  <div key={i} style={{ padding: 10, background: 'var(--bg)', borderRadius: 8 }}>
+                    <div style={{ fontWeight: 500, marginBottom: 6 }}>Question page {i + 1}</div>
+                    {existingQImgs[i]?.url && !questionImages[i] && <div style={{ marginBottom: 6 }}><a href={existingQImgs[i].url} target="_blank" rel="noreferrer">Current image</a></div>}
+                    <input type="file" accept="image/*" onChange={(e) => setQImg(i, e.target.files?.[0] || null)} />
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Model answer image pages <small className="muted">(up to 3)</small></span>
+              <div className="form" style={{ gap: 10 }}>
+                {Array.from({ length: aCount }).map((_, i) => (
+                  <div key={i} style={{ padding: 10, background: 'var(--bg)', borderRadius: 8 }}>
+                    <div style={{ fontWeight: 500, marginBottom: 6 }}>Answer page {i + 1}</div>
+                    {existingAImgs[i]?.url && !answerImages[i] && <div style={{ marginBottom: 6 }}><a href={existingAImgs[i].url} target="_blank" rel="noreferrer">Current image</a></div>}
+                    <input type="file" accept="image/*" onChange={(e) => setAImg(i, e.target.files?.[0] || null)} />
+                  </div>
+                ))}
+              </div>
+            </div>
+            <label className="f"><span>Model answer notes <small className="muted">(optional, for grading/reference)</small></span><textarea value={modelAnswer} onChange={(e) => setModelAnswer(e.target.value)} rows={3} placeholder="Optional text notes for the model answer" /></label>
+          </>
+        )}
+
         <label className="f"><span>Explanation <small>(shown when a student taps Explain)</small></span><textarea value={explanation} onChange={(e) => setExplanation(e.target.value)} placeholder="Why is this the correct answer?" rows={3} /></label>
+
         <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Header image <small className="muted" style={{ fontWeight: 400 }}>(shown at top of question in WhatsApp)</small></span>
           {question?.headerImage && !removeHeader && !headerImage && (
             <div className="row"><a href={question.header_url} target="_blank" rel="noreferrer">Current image</a>
@@ -165,7 +329,7 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
           {removeHeader && !headerImage && <div className="muted">Header image will be removed on save.</div>}
           <input type="file" accept="image/*" onChange={(e) => setHeaderImage(e.target.files[0] || null)} />
         </div>
-        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Attached image/document <small className="muted" style={{ fontWeight: 400 }}>(image, PDF, etc. � sent with the question)</small></span>
+        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Attached image/document <small className="muted" style={{ fontWeight: 400 }}>(image, PDF, etc. — sent with the question)</small></span>
           {question?.document_name && !removeDoc && !file && (
             <div className="row"><a href={question.document_url} target="_blank" rel="noreferrer">{question.document_name}</a>
               <button type="button" className="btn sm danger" onClick={() => setRemoveDoc(true)}>Remove</button></div>
@@ -176,13 +340,12 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
         {err && <div className="err">{err}</div>}
         <div className="row" style={{ justifyContent: 'flex-end' }}>
           <button type="button" className="btn" onClick={onClose}>Cancel</button>
-          <button className="btn primary" disabled={busy || !text.trim()}>{busy ? 'Saving�' : 'Save question'}</button>
+          <button className="btn primary" disabled={busy || (qType === 'objective' && !text.trim())}>{busy ? 'Saving…' : 'Save question'}</button>
         </div>
       </form>
     </Modal>
   )
 }
-
 function TopicDropdown({ topics, onSelect, onAddChild, onEdit, onDelete, selectedId, parentId = null, depth = 0 }) {
   if (!topics?.length) return null
   return (
@@ -296,7 +459,16 @@ export default function QuestionBank() {
                     <button className="btn sm danger" onClick={() => del('question', `/questions/${q.id}`)}>Delete</button>
                   </div>
                 </div>
-                <div>{q.options.map((o, i) => <div key={i} className={`opt ${i === q.correct ? 'correct' : ''}`}><b>{LETTERS[i]}.</b> {o} {i === q.correct && <span>✓ correct</span>}</div>)}</div>
+                {q.type === 'long' ? (
+                  <div>
+                    <div className="opt correct" style={{ display: 'inline-block', marginBottom: 6 }}><b>Long format</b>{q.promptType === 'image' ? ' · Image question' : ' · Text question'}</div>
+                    {q.promptType === 'image' && <div className="muted">Question pages: {q.question_images?.length || 0} · Answer pages: {q.model_answer_images?.length || 0}</div>}
+                    {q.text && q.text !== '(Image question)' && <div style={{ marginTop: 4 }}>{q.text}</div>}
+                    {q.modelAnswer && <div className="expl"><b>Model answer:</b> {q.modelAnswer}</div>}
+                  </div>
+                ) : (
+                  <div>{(q.options || []).map((o, i) => <div key={i} className={`opt ${i === q.correct ? 'correct' : ''}`}><b>{LETTERS[i]}.</b> {o} {i === q.correct && <span>✓ correct</span>}</div>)}</div>
+                )}
                 {q.explanation && <div className="expl"><b>Explanation:</b> {q.explanation}</div>}
                 {q.document_url && <div>📎 <a href={q.document_url} target="_blank" rel="noreferrer">{q.document_name}</a></div>}
               </div>

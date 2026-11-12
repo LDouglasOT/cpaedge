@@ -5,10 +5,12 @@ import WhatsApp from './pages/WhatsApp.jsx'
 import Funds from './pages/Funds.jsx'
 import QuestionBank from './pages/QuestionBank.jsx'
 import Admins from './pages/Admins.jsx'
+import Accounts from './pages/Accounts.jsx'
 
 const TABS = [
   { id: 'dashboard', label: 'Dashboard', icon: '▦', view: Dashboard },
   { id: 'whatsapp', label: 'WhatsApp', icon: '✆', view: WhatsApp },
+  { id: 'accounts', label: 'Accounts', icon: '👤', view: Accounts },
   { id: 'funds', label: 'Funds', icon: '＄', view: Funds },
   { id: 'bank', label: 'Question bank', icon: '☰', view: QuestionBank },
   { id: 'admins', label: 'Administrators', icon: '👥', view: Admins },

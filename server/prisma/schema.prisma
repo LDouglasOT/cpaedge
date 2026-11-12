@@ -64,20 +64,27 @@ model Topic {
 }
 
 model Question {
-  id            String    @id @default(dbgenerated("gen_random_uuid()"))
-  topicId       String    @map("topic_id")
-  topic         Topic     @relation(fields: [topicId], references: [id], onDelete: Cascade)
-  text          String
-  options       String
-  correct       Int
-  explanation   String    @default("")
-  documentFile  String?   @map("document_file")
-  documentName  String?   @map("document_name")
-  documentMime  String?   @map("document_mime")
-  headerImage   String?   @map("header_image")
-  headerMime    String?   @map("header_mime")
-  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  attempts      Attempt[]
+  id               String    @id @default(dbgenerated("gen_random_uuid()"))
+  topicId          String    @map("topic_id")
+  topic            Topic     @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  text             String
+  type             String    @default("objective")
+  options          String    @default("[]")
+  correct          Int       @default(0)
+  explanation      String    @default("")
+  documentFile     String?   @map("document_file")
+  documentName     String?   @map("document_name")
+  documentMime     String?   @map("document_mime")
+  headerImage      String?   @map("header_image")
+  headerMime       String?   @map("header_mime")
+  questionImages   String?   @map("question_images")
+  promptType       String    @default("text") @map("prompt_type")
+  answerType       String    @default("text") @map("answer_type")
+  modelAnswer      String    @default("") @map("model_answer")
+  modelAnswerImages String?  @map("model_answer_images")
+  modelAnswerMime  String?   @map("model_answer_mime")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  attempts         Attempt[]
 
   @@map("questions")
 }
@@ -92,6 +99,7 @@ model Student {
   premiumSince DateTime?     @map("premium_since") @db.Timestamptz(6)
   premiumUntil DateTime?     @map("premium_until") @db.Timestamptz(6)
   trialsUsed   Int           @default(0) @map("trials_used")
+  banned       Boolean       @default(false)
   state        String        @default("{}")
   createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
   lastSeen     DateTime      @default(now()) @map("last_seen") @db.Timestamptz(6)
@@ -104,14 +112,20 @@ model Student {
 }
 
 model Attempt {
-  id         String   @id @default(dbgenerated("gen_random_uuid()"))
-  studentId  String   @map("student_id")
-  student    Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  questionId String   @map("question_id")
-  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
-  selected   Int
-  isCorrect  Boolean  @map("is_correct")
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  id          String   @id @default(dbgenerated("gen_random_uuid()"))
+  studentId   String   @map("student_id")
+  student     Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  questionId  String   @map("question_id")
+  question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  selected    Int      @default(-1)
+  isCorrect   Boolean  @default(false) @map("is_correct")
+  answerText  String?  @map("answer_text")
+  answerImages String? @map("answer_images")
+  answerMime  String?  @map("answer_mime")
+  score       Int?
+  feedback    String?  @default("")
+  graded      Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   @@index([studentId], map: "idx_attempts_student")
   @@index([questionId], map: "idx_attempts_question")

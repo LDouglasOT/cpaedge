@@ -432,6 +432,10 @@ async function process(ctx, msg, jid) {
   const realJid = msg.key.remoteJidAlt || msg.key.senderPn || jid
   const phone = realJid.split('@')[0].split(':')[0]
   let s = await upsertStudent({ phone, jid, name: msg.pushName, sessionId: ctx.sessionId })
+  if (s.banned) {
+    await text(ctx, jid, 'Your account has been suspended. Please contact support if you think this is a mistake.')
+    return
+  }
   const state = getState(s)
   const { id } = input
   const raw = (input.text || '').trim()

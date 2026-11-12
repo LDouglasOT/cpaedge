@@ -220,15 +220,51 @@ api.post('/payments/check-status', wrap(async (req, res) => {
   res.json({ status: result.status, transaction: result.transaction })
 }))
 
-/* ---------- students ---------- */
-api.get('/students', wrap(async (_req, res) => {
+/* ---------- students / accounts ---------- */
+api.get('/students', wrap(async (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase()
+  const status = String(req.query.status || 'all')
   const board = Object.fromEntries((await leaderboard()).map((r) => [r.id, r]))
-  const students = await prisma.student.findMany({
+  const trial = Number(await getSetting('trial_limit'))
+  let students = await prisma.student.findMany({
     orderBy: { id: 'desc' },
-    take: 500,
-    select: { id: true, phone: true, name: true, premium: true, trialsUsed: true, createdAt: true, lastSeen: true }
+    take: 1000,
+    select: { id: true, phone: true, name: true, jid: true, premium: true, banned: true, trialsUsed: true, premiumSince: true, premiumUntil: true, createdAt: true, lastSeen: true }
   })
-  res.json(students.map((s) => ({ ...s, rank: board[s.id]?.rank ?? null, attempted: board[s.id]?.attempted ?? 0, correct: board[s.id]?.correct ?? 0, accuracy: board[s.id]?.accuracy ?? 0 })))
+  students = students.map((s) => {
+    const b = board[s.id] || {}
+    const exhausted = !s.premium && s.trialsUsed >= trial
+    const accountStatus = s.banned ? 'banned' : s.premium ? 'premium' : exhausted ? 'trial_exhausted' : 'active'
+    return { ...s, rank: b.rank ?? null, attempted: b.attempted ?? 0, correct: b.correct ?? 0, accuracy: b.accuracy ?? 0, exhausted, status: accountStatus }
+  })
+  if (q) students = students.filter((s) => (s.name || '').toLowerCase().includes(q) || String(s.phone || '').includes(q))
+  if (status === 'banned') students = students.filter((s) => s.banned)
+  else if (status === 'premium') students = students.filter((s) => s.premium)
+  else if (status === 'free') students = students.filter((s) => !s.premium)
+  else if (status === 'active') students = students.filter((s) => !s.banned)
+  else if (status === 'trial_exhausted') students = students.filter((s) => s.exhausted)
+  res.json(students)
+}))
+
+api.put('/students/:id', wrap(async (req, res) => {
+  const s = await prisma.student.findUnique({ where: { id: req.params.id } })
+  if (!s) return res.status(404).json({ error: 'Student not found' })
+  const data = {}
+  if (req.body?.name !== undefined) data.name = String(req.body.name || '').trim()
+  if (req.body?.banned !== undefined) data.banned = !!req.body.banned
+  if (req.body?.trialsUsed !== undefined) {
+    const n = Number(req.body.trialsUsed)
+    if (!Number.isInteger(n) || n < 0) return bad(res, 'Trials used must be a non-negative integer')
+    data.trialsUsed = n
+  }
+  if (req.body?.premium !== undefined) {
+    data.premium = !!req.body.premium
+    if (data.premium && !s.premium) data.premiumSince = new Date()
+    if (!data.premium) { data.premiumSince = null; data.premiumUntil = null }
+  }
+  if (req.body?.premiumUntil !== undefined) data.premiumUntil = req.body.premiumUntil ? new Date(req.body.premiumUntil) : null
+  const updated = await prisma.student.update({ where: { id: s.id }, data })
+  res.json({ ok: true, student: updated })
 }))
 
 /* ---------- question bank ---------- */
@@ -434,7 +470,19 @@ api.delete('/topics/:id', wrap(async (req, res) => {
   res.json({ ok: true })
 }))
 
-const shape = (q) => ({ ...q, options: JSON.parse(q.options || '[]'), document_url: q.documentFile ? getS3Url(q.documentFile) : null, header_url: q.headerImage ? getS3Url(q.headerImage) : null })
+const parseJson = (v, fallback) => { try { return JSON.parse(v || '') ?? fallback } catch { return fallback } }
+const shape = (q) => {
+  const questionImages = parseJson(q.questionImages, []).map((img) => (img?.file ? { ...img, url: getS3Url(img.file) } : img))
+  const modelAnswerImages = parseJson(q.modelAnswerImages, []).map((img) => (img?.file ? { ...img, url: getS3Url(img.file) } : img))
+  return {
+    ...q,
+    options: parseJson(q.options, []),
+    question_images: questionImages,
+    model_answer_images: modelAnswerImages,
+    document_url: q.documentFile ? getS3Url(q.documentFile) : null,
+    header_url: q.headerImage ? getS3Url(q.headerImage) : null,
+  }
+}
 
 api.get('/topics/:id/questions', wrap(async (req, res) => {
   const questions = await prisma.question.findMany({
@@ -447,17 +495,47 @@ api.get('/topics/:id/questions', wrap(async (req, res) => {
 const DEFAULT_OPTIONS = ['A', 'B', 'C']
 
 function readQuestion(req) {
+  const type = String(req.body?.type || 'objective') === 'long' ? 'long' : 'objective'
+  const explanation = String(req.body?.explanation || '').trim()
+
+  if (type === 'objective') {
+    const text = String(req.body?.text || '').trim()
+    let options
+    try { options = JSON.parse(req.body?.options || '[]') } catch { options = [] }
+    options = (Array.isArray(options) ? options : []).map((o) => String(o).trim())
+    if (options.length === 0) options = [...DEFAULT_OPTIONS]
+    if (options.length !== 3 || options.some((o) => !o)) return { error: 'Provide text for options A, B, and C' }
+    const correct = Number(req.body?.correct)
+    if (!text) return { error: 'Question text is required' }
+    if (options.some((o) => o.length > 200)) return { error: 'Options must be 200 characters or fewer' }
+    if (!Number.isInteger(correct) || correct < 0 || correct >= 3) return { error: 'Select the correct answer (A, B, or C)' }
+    return { type: 'objective', text, options, correct, explanation, questionImages: [], promptType: 'text', answerType: 'text', modelAnswer: '', modelAnswerImages: [] }
+  }
+
+  const isImageQuestion = String(req.body?.is_image_question || 'false') === 'true'
+  const promptType = isImageQuestion ? 'image' : 'text'
   const text = String(req.body?.text || '').trim()
-  let options
-  try { options = JSON.parse(req.body?.options || '[]') } catch { options = [] }
-  options = (Array.isArray(options) ? options : []).map((o) => String(o).trim())
-  if (options.length === 0) options = [...DEFAULT_OPTIONS]
-  if (options.length !== 3 || options.some((o) => !o)) return { error: 'Provide text for options A, B, and C' }
-  const correct = Number(req.body?.correct)
-  if (!text) return { error: 'Question text is required' }
-  if (options.some((o) => o.length > 200)) return { error: 'Options must be 200 characters or fewer' }
-  if (!Number.isInteger(correct) || correct < 0 || correct >= 3) return { error: 'Select the correct answer (A, B, or C)' }
-  return { text, options, correct, explanation: String(req.body?.explanation || '').trim() }
+  const modelAnswer = String(req.body?.model_answer || '').trim()
+  if (!isImageQuestion && !text) return { error: 'Question text is required' }
+  if (isImageQuestion) {
+    const count = Number(req.body?.question_image_count || 0)
+    if (!Number.isInteger(count) || count < 1 || count > 3) return { error: 'Image questions require 1 to 3 question pages' }
+  }
+  const answerCount = Number(req.body?.answer_image_count || 0)
+  if (isImageQuestion && (!Number.isInteger(answerCount) || answerCount < 1 || answerCount > 3)) return { error: 'Image questions require 1 to 3 answer pages' }
+  if (isImageQuestion && !modelAnswer && answerCount === 0) return { error: 'Provide a model answer (text and/or answer images)' }
+
+  return {
+    type: 'long',
+    text: text || '(Image question)',
+    options: [],
+    correct: -1,
+    explanation,
+    promptType,
+    answerType: isImageQuestion ? 'image' : 'text',
+    modelAnswer,
+    isImageQuestion,
+  }
 }
 
 function readBulkQuestions(text) {
@@ -532,29 +610,80 @@ function readBulkQuestionsFromExcel(buffer) {
   return { questions, errors }
 }
 
-api.post('/topics/:id/questions', upload.fields([{ name: 'document', maxCount: 1 }, { name: 'headerImage', maxCount: 1 }]), wrap(async (req, res) => {
+const QUESTION_UPLOAD_FIELDS = [
+  { name: 'document', maxCount: 1 },
+  { name: 'headerImage', maxCount: 1 },
+  { name: 'questionImage1', maxCount: 1 },
+  { name: 'questionImage2', maxCount: 1 },
+  { name: 'questionImage3', maxCount: 1 },
+  { name: 'modelAnswerImage1', maxCount: 1 },
+  { name: 'modelAnswerImage2', maxCount: 1 },
+  { name: 'modelAnswerImage3', maxCount: 1 },
+]
+
+async function uploadQuestionImages(req, prefix, count) {
+  const out = []
+  for (let i = 1; i <= count; i++) {
+    const f = req.files?.[prefix + i]?.[0]
+    if (!f) return { error: `Missing ${prefix} page ${i}` }
+    const up = await uploadToS3(f)
+    out.push({ file: up.filename, mime: up.mimetype, name: up.originalname || null, page: i })
+  }
+  return { images: out }
+}
+
+async function resolveQuestionImages(req, existingJson, prefix, count) {
+  const prev = parseJson(existingJson, [])
+  const keep = parseJson(req.body?.['keep_' + prefix + 's'], [])
+  const out = []
+  for (let i = 1; i <= count; i++) {
+    const f = req.files?.[prefix + i]?.[0]
+    if (f) {
+      const up = await uploadToS3(f)
+      out.push({ file: up.filename, mime: up.mimetype, name: up.originalname || null, page: i })
+      continue
+    }
+    const kept = keep.find((k) => Number(k.page) === i) || prev[i - 1]
+    if (kept?.file) out.push({ file: kept.file, mime: kept.mime || null, name: kept.name || null, page: i })
+    else return { error: `Provide image for ${prefix} page ${i}` }
+  }
+  const keptFiles = new Set(out.map((x) => x.file))
+  for (const p of prev) if (p?.file && !keptFiles.has(p.file)) await rmFile(p.file)
+  return { images: out }
+}
+
+api.post('/topics/:id/questions', upload.fields(QUESTION_UPLOAD_FIELDS), wrap(async (req, res) => {
+  const cleanupAll = async () => { for (const arr of Object.values(req.files || {})) for (const f of arr || []) await rmFile(f?.filename) }
   const q = readQuestion(req)
-  if (q.error) { 
-    if (req.files?.document?.[0]) await rmFile(req.files.document[0].filename)
-    if (req.files?.headerImage?.[0]) await rmFile(req.files.headerImage[0].filename)
-    return bad(res, q.error) 
-  }
+  if (q.error) { await cleanupAll(); return bad(res, q.error) }
   const topic = await prisma.topic.findUnique({ where: { id: req.params.id } })
-  if (!topic) { 
-    if (req.files?.document?.[0]) await rmFile(req.files.document[0].filename)
-    if (req.files?.headerImage?.[0]) await rmFile(req.files.headerImage[0].filename)
-    return res.status(404).json({ error: 'Sub topic not found' }) 
-  }
+  if (!topic) { await cleanupAll(); return res.status(404).json({ error: 'Sub topic not found' }) }
+
   const docFile = req.files?.document?.[0]
   const headerFile = req.files?.headerImage?.[0]
   let docResult = null
   let headerResult = null
   if (docFile) docResult = await uploadToS3(docFile)
   if (headerFile) headerResult = await uploadToS3(headerFile)
+
+  let questionImages = []
+  let modelAnswerImages = []
+  if (q.type === 'long' && q.isImageQuestion) {
+    const qCount = Number(req.body?.question_image_count || 0)
+    const aCount = Number(req.body?.answer_image_count || 0)
+    const qi = await uploadQuestionImages(req, 'questionImage', qCount)
+    if (qi.error) { await cleanupAll(); if (docResult?.filename) await rmFile(docResult.filename); if (headerResult?.filename) await rmFile(headerResult.filename); return bad(res, qi.error) }
+    const ai = await uploadQuestionImages(req, 'modelAnswerImage', aCount)
+    if (ai.error) { await cleanupAll(); for (const x of qi.images || []) await rmFile(x.file); if (docResult?.filename) await rmFile(docResult.filename); if (headerResult?.filename) await rmFile(headerResult.filename); return bad(res, ai.error) }
+    questionImages = qi.images || []
+    modelAnswerImages = ai.images || []
+  }
+
   const r = await prisma.question.create({
     data: {
       topicId: req.params.id,
       text: q.text,
+      type: q.type,
       options: JSON.stringify(q.options),
       correct: q.correct,
       explanation: q.explanation,
@@ -562,7 +691,13 @@ api.post('/topics/:id/questions', upload.fields([{ name: 'document', maxCount: 1
       documentName: docResult?.originalname ?? null,
       documentMime: docResult?.mimetype ?? null,
       headerImage: headerResult?.filename ?? null,
-      headerMime: headerResult?.mimetype ?? null
+      headerMime: headerResult?.mimetype ?? null,
+      questionImages: questionImages.length ? JSON.stringify(questionImages) : null,
+      promptType: q.promptType || 'text',
+      answerType: q.answerType || 'text',
+      modelAnswer: q.modelAnswer || '',
+      modelAnswerImages: modelAnswerImages.length ? JSON.stringify(modelAnswerImages) : null,
+      modelAnswerMime: modelAnswerImages[0]?.mime ?? null,
     }
   })
   res.status(201).json(shape(r))
@@ -601,44 +736,42 @@ api.post('/topics/:id/questions/bulk', upload.single('file'), wrap(async (req, r
   res.status(201).json({ imported: created.length, questions: created.map(shape) })
 }))
 
-api.put('/questions/:id', upload.fields([{ name: 'document', maxCount: 1 }, { name: 'headerImage', maxCount: 1 }]), wrap(async (req, res) => {
+api.put('/questions/:id', upload.fields(QUESTION_UPLOAD_FIELDS), wrap(async (req, res) => {
+  const cleanupAll = async () => { for (const arr of Object.values(req.files || {})) for (const f of arr || []) await rmFile(f?.filename) }
   const id = req.params.id
   const existing = await prisma.question.findUnique({ where: { id } })
   const q = readQuestion(req)
-  if (!existing) { 
-    if (req.files?.document?.[0]) await rmFile(req.files.document[0].filename)
-    if (req.files?.headerImage?.[0]) await rmFile(req.files.headerImage[0].filename)
-    return res.status(404).json({ error: 'Not found' }) 
-  }
-  if (q.error) { 
-    if (req.files?.document?.[0]) await rmFile(req.files.document[0].filename)
-    if (req.files?.headerImage?.[0]) await rmFile(req.files.headerImage[0].filename)
-    return bad(res, q.error) 
-  }
+  if (!existing) { await cleanupAll(); return res.status(404).json({ error: 'Not found' }) }
+  if (q.error) { await cleanupAll(); return bad(res, q.error) }
+
   let { documentFile: file, documentName: name, documentMime: mime, headerImage: hImg, headerMime: hMime } = existing
-  if (req.files?.document?.[0] || req.body?.remove_document === 'true') {
-    await rmFile(file)
-    file = name = mime = null
+  if (req.files?.document?.[0] || req.body?.remove_document === 'true') { await rmFile(file); file = name = mime = null }
+  if (req.files?.document?.[0]) { const result = await uploadToS3(req.files.document[0]); file = result.filename; name = result.originalname; mime = result.mimetype }
+  if (req.files?.headerImage?.[0] || req.body?.remove_header === 'true') { await rmFile(hImg); hImg = hMime = null }
+  if (req.files?.headerImage?.[0]) { const result = await uploadToS3(req.files.headerImage[0]); hImg = result.filename; hMime = result.mimetype }
+
+  let questionImages = null
+  let modelAnswerImages = null
+  const prevQImgs = parseJson(existing.questionImages, [])
+  const prevAImgs = parseJson(existing.modelAnswerImages, [])
+  if (q.type === 'long' && q.isImageQuestion) {
+    const qCount = Number(req.body?.question_image_count || 0)
+    const aCount = Number(req.body?.answer_image_count || 0)
+    const qi = await resolveQuestionImages(req, existing.questionImages, 'questionImage', qCount)
+    if (qi.error) { await cleanupAll(); return bad(res, qi.error) }
+    const ai = await resolveQuestionImages(req, existing.modelAnswerImages, 'modelAnswerImage', aCount)
+    if (ai.error) { await cleanupAll(); for (const x of qi.images || []) await rmFile(x.file); return bad(res, ai.error) }
+    questionImages = JSON.stringify(qi.images || [])
+    modelAnswerImages = JSON.stringify(ai.images || [])
+  } else {
+    for (const p of [...prevQImgs, ...prevAImgs]) if (p?.file) await rmFile(p.file)
   }
-  if (req.files?.document?.[0]) {
-    const result = await uploadToS3(req.files.document[0])
-    file = result.filename
-    name = result.originalname
-    mime = result.mimetype
-  }
-  if (req.files?.headerImage?.[0] || req.body?.remove_header === 'true') {
-    await rmFile(hImg)
-    hImg = hMime = null
-  }
-  if (req.files?.headerImage?.[0]) {
-    const result = await uploadToS3(req.files.headerImage[0])
-    hImg = result.filename
-    hMime = result.mimetype
-  }
+
   const r = await prisma.question.update({
     where: { id },
     data: {
       text: q.text,
+      type: q.type,
       options: JSON.stringify(q.options),
       correct: q.correct,
       explanation: q.explanation,
@@ -646,16 +779,24 @@ api.put('/questions/:id', upload.fields([{ name: 'document', maxCount: 1 }, { na
       documentName: name,
       documentMime: mime,
       headerImage: hImg,
-      headerMime: hMime
+      headerMime: hMime,
+      questionImages,
+      promptType: q.promptType || 'text',
+      answerType: q.answerType || 'text',
+      modelAnswer: q.modelAnswer || '',
+      modelAnswerImages,
+      modelAnswerMime: parseJson(modelAnswerImages, [])[0]?.mime ?? null,
     }
   })
   res.json(shape(r))
 }))
 
 api.delete('/questions/:id', wrap(async (req, res) => {
-  const q = await prisma.question.findUnique({ where: { id: req.params.id }, select: { documentFile: true, headerImage: true } })
+  const q = await prisma.question.findUnique({ where: { id: req.params.id }, select: { documentFile: true, headerImage: true, questionImages: true, modelAnswerImages: true } })
   await prisma.question.delete({ where: { id: req.params.id } })
   rmFile(q?.documentFile)
   rmFile(q?.headerImage)
+  for (const p of parseJson(q?.questionImages, [])) if (p?.file) rmFile(p.file)
+  for (const p of parseJson(q?.modelAnswerImages, [])) if (p?.file) rmFile(p.file)
   res.json({ ok: true })
 }))
