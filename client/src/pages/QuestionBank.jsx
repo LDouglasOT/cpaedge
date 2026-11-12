@@ -109,10 +109,10 @@ Taxation|Financial Accounting" />
 }
 
 function QuestionModal({ topicId, question, onClose, onSaved }) {
-  const defaultOptions = ['', '', '']
+  const initialOptions = Array.isArray(question?.options) && question.options.length === 3 ? question.options : ['', '', '']
   const [text, setText] = useState(question?.text || '')
-  const [options, setOptions] = useState(question?.options || defaultOptions)
-  const [correct, setCorrect] = useState(question?.correct ?? 0)
+  const [options, setOptions] = useState(initialOptions)
+  const [correct, setCorrect] = useState(Number.isInteger(question?.correct) ? question.correct : 0)
   const [explanation, setExplanation] = useState(question?.explanation || '')
   const [file, setFile] = useState(null)
   const [removeDoc, setRemoveDoc] = useState(false)
@@ -122,16 +122,12 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
   const [busy, setBusy] = useState(false)
 
   const setOpt = (i, v) => setOptions(options.map((o, k) => (k === i ? v : o)))
-  const removeOpt = (i) => {
-    setOptions(options.filter((_, k) => k !== i))
-    setCorrect((c) => (c === i ? null : c > i ? c - 1 : c))
-  }
 
   const submit = async (e) => {
     e.preventDefault(); setErr('')
     const clean = options.map((o) => o.trim())
-    if (clean.some((o) => !o)) return setErr('Fill in every option or remove the empty ones')
-    if (correct === null) return setErr('Select the correct answer')
+    if (clean.some((o) => !o)) return setErr('Fill in all three answers (A, B, C)')
+    if (!(correct >= 0 && correct <= 2)) return setErr('Select the correct answer')
     const form = new FormData()
     form.set('text', text); form.set('options', JSON.stringify(clean)); form.set('correct', String(correct)); form.set('explanation', explanation)
     if (file) form.set('document', file)
@@ -149,19 +145,15 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
     <Modal title={question ? 'Edit question' : 'Add question'} onClose={onClose}>
       <form className="form" onSubmit={submit}>
         <label className="f"><span>Question</span><textarea value={text} onChange={(e) => setText(e.target.value)} autoFocus rows={4} placeholder="Enter your question here (supports multiple lines)" /></label>
-        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Answer options <small className="muted" style={{ fontWeight: 400 }}>— Select the correct one.</small></span>
+        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Answers <small className="muted" style={{ fontWeight: 400 }}>� Options A, B, C are fixed. Enter each answer and tick the correct one.</small></span>
           <div className="form" style={{ gap: 8 }}>
-            {options.map((o, i) => (
-              <div className="optrow" key={i}>
-                <input type="radio" name="correct" checked={correct === i} onChange={() => setCorrect(i)} aria-label={`Option ${LETTERS[i]} is correct`} />
-                <input type="text" value={o} onChange={(e) => setOpt(i, e.target.value)} placeholder={`Option ${LETTERS[i]}`} maxLength={200} />
-                {options.length > 2 ? <button type="button" className="icon" onClick={() => removeOpt(i)} aria-label={`Remove option ${LETTERS[i]}`}>✕</button> : <span />}
+            {LETTERS.map((letter, i) => (
+              <div className="optrow" key={letter}>
+                <input type="radio" name="correct" checked={correct === i} onChange={() => setCorrect(i)} aria-label={`Option ${letter} is correct`} />
+                <div style={{ fontWeight: 600, width: 18 }}>{letter}.</div>
+                <input type="text" value={options[i] || ''} onChange={(e) => setOpt(i, e.target.value)} placeholder={`Answer ${letter}`} maxLength={200} />
               </div>
             ))}
-            {options.length < 3 && <div><button type="button" className="btn sm" onClick={() => {
-                const nextIdx = options.length
-                setOptions([...options, defaultOptions[nextIdx] || `Option ${LETTERS[nextIdx]}`])
-              }}>+ Add option</button></div>}
           </div>
         </div>
         <label className="f"><span>Explanation <small>(shown when a student taps Explain)</small></span><textarea value={explanation} onChange={(e) => setExplanation(e.target.value)} placeholder="Why is this the correct answer?" rows={3} /></label>
@@ -173,7 +165,7 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
           {removeHeader && !headerImage && <div className="muted">Header image will be removed on save.</div>}
           <input type="file" accept="image/*" onChange={(e) => setHeaderImage(e.target.files[0] || null)} />
         </div>
-        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Attached image/document <small className="muted" style={{ fontWeight: 400 }}>(image, PDF, etc. — sent with the question)</small></span>
+        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Attached image/document <small className="muted" style={{ fontWeight: 400 }}>(image, PDF, etc. � sent with the question)</small></span>
           {question?.document_name && !removeDoc && !file && (
             <div className="row"><a href={question.document_url} target="_blank" rel="noreferrer">{question.document_name}</a>
               <button type="button" className="btn sm danger" onClick={() => setRemoveDoc(true)}>Remove</button></div>
@@ -184,7 +176,7 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
         {err && <div className="err">{err}</div>}
         <div className="row" style={{ justifyContent: 'flex-end' }}>
           <button type="button" className="btn" onClick={onClose}>Cancel</button>
-          <button className="btn primary" disabled={busy || !text.trim()}>{busy ? 'Saving…' : 'Save question'}</button>
+          <button className="btn primary" disabled={busy || !text.trim()}>{busy ? 'Saving�' : 'Save question'}</button>
         </div>
       </form>
     </Modal>
@@ -292,7 +284,7 @@ export default function QuestionBank() {
           <div className="row between" style={{ marginBottom: 10 }}>
             <h2>{topic ? `${topic.name} · questions` : 'Questions'}</h2>
             <button className="btn sm primary" disabled={!topic} onClick={() => setModal({ type: 'question' })}>+ Add question</button>
-            <button className="btn sm" disabled={!topic} onClick={() => setModal({ type: 'bulk' })}>Bulk import</button>
+            <button className="btn sm" disabled={!topic} onClick={() => setModal({ type: 'bulk' })}>Bulk import (Excel)</button>
           </div>
           {!topic ? <div className="empty">Select a topic to see and add its questions.</div> : !questions.data?.length ? <div className="empty">No questions yet. Add the first one.</div> : (
             questions.data.map((q, n) => (
@@ -345,52 +337,41 @@ export default function QuestionBank() {
 }
 
 function BulkImportModal({ topicId, onClose, onSaved }) {
-  const [text, setText] = useState('')
+  const [file, setFile] = useState(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
-  const [preview, setPreview] = useState(null)
+
   const submit = async (e) => {
     e.preventDefault(); setErr('')
+    if (!file) return setErr('Choose an Excel file to upload')
+    const form = new FormData()
+    form.set('file', file)
     setBusy(true)
     try {
-      const { imported } = await api(`/topics/${topicId}/questions/bulk`, { method: 'POST', body: { text } })
+      await api(`/topics/${topicId}/questions/bulk`, { method: 'POST', form })
       onSaved()
     } catch (e2) { setErr(e2.message); setBusy(false) }
   }
-  const analyze = () => {
-    const lines = String(text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
-    let valid = 0, errors = 0
-    for (const line of lines) {
-      const parts = line.split('|').map((p) => p.trim())
-      if (parts.length < 4) { errors++; continue }
-      const optionList = parts.slice(0, -2)
-      const correctIndex = Number(parts[parts.length - 2])
-      if (optionList.length < 2 || !Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex >= optionList.length) { errors++; continue }
-      valid++
-    }
-    setPreview({ valid, errors, total: lines.length })
-  }
+
   return (
-    <Modal title={`Bulk import questions (max 2000)`} onClose={onClose}>
+    <Modal title="Bulk import questions from Excel" onClose={onClose}>
       <form className="form" onSubmit={submit}>
-        <label className="f"><span>Questions <small className="muted" style={{ fontWeight: 400 }}>(one per line, max 2000)</small></span>
-          <textarea value={text} onChange={(e) => { setText(e.target.value); analyze() }} rows={14} placeholder="What is the capital of Uganda?|Kampala|Nairobi|Kigali|0|It is the capital city." /></label>
-        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Format</span>
-          <div className="muted" style={{ fontSize: 12, lineHeight: 1.6 }}>
-            `text&#124;option A&#124;option B&#124;option C&#124;correct index (0-based)&#124;explanation`<br />
-            Example: `What is 2+2?&#124;3&#124;4&#124;5&#124;2&#124;Because 2+2=4`<br />
-            Use at least 2 options, at most 3. Correct index starts at 0. Explanation is optional.
+        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Excel file (.xlsx, .xls)</span>
+          <input type="file" accept=".xlsx,.xls,.csv" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+        </div>
+        <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Required columns</span>
+          <div className="muted" style={{ fontSize: 12, lineHeight: 1.7 }}>
+            <b>question</b> | <b>first answer</b> | <b>second answer</b> | <b>third answer</b> | <b>correct answer</b> | <i>explanation (optional)</i><br />
+            Correct answer must be <b>A</b>, <b>B</b>, or <b>C</b> (matching first/second/third).<br />
+            Options A, B, C are fixed by default � only tick/select the correct answer in that column.<br />
+            Example: <code>What is 2+1? | 3 | 1 | 2 | A | 2+1 equals 3</code>
           </div>
         </div>
-        {preview && (
-          <div style={{ padding: 10, background: 'var(--bg)', borderRadius: 8, marginBottom: 10 }}>
-            {preview.valid} valid · {preview.errors} invalid of {preview.total} lines
-          </div>
-        )}
+        {file && <div style={{ padding: 10, background: 'var(--bg)', borderRadius: 8 }}>Selected: <b>{file.name}</b></div>}
         {err && <div className="err">{err}</div>}
         <div className="row" style={{ justifyContent: 'flex-end' }}>
           <button type="button" className="btn" onClick={onClose}>Cancel</button>
-          <button className="btn primary" disabled={busy || !text.trim()}>{busy ? 'Importing…' : 'Import questions'}</button>
+          <button className="btn primary" disabled={busy || !file}>{busy ? 'Importing�' : 'Import questions'}</button>
         </div>
       </form>
     </Modal>

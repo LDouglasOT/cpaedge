@@ -3,6 +3,7 @@ import multer from 'multer'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import * as XLSX from 'xlsx'
 import { prisma, allSettings, setSetting, getSetting, loadSettings, UPLOAD_DIR } from './db.js'
 import { uploadToS3, deleteFromS3, getS3Url } from './storage.js'
 import { checkPassword, issueToken, requireAuth, requireRole, authenticateAdmin, bootstrapAdmin, hashPassword } from './auth.js'
@@ -443,17 +444,19 @@ api.get('/topics/:id/questions', wrap(async (req, res) => {
   res.json(questions.map(shape))
 }))
 
+const DEFAULT_OPTIONS = ['A', 'B', 'C']
+
 function readQuestion(req) {
   const text = String(req.body?.text || '').trim()
   let options
   try { options = JSON.parse(req.body?.options || '[]') } catch { options = [] }
-  options = (Array.isArray(options) ? options : []).map((o) => String(o).trim()).filter(Boolean)
+  options = (Array.isArray(options) ? options : []).map((o) => String(o).trim())
+  if (options.length === 0) options = [...DEFAULT_OPTIONS]
+  if (options.length !== 3 || options.some((o) => !o)) return { error: 'Provide text for options A, B, and C' }
   const correct = Number(req.body?.correct)
   if (!text) return { error: 'Question text is required' }
-  if (options.length < 2) return { error: 'Add at least 2 answer options' }
-  if (options.length > 3) return { error: 'A question can have at most 3 options' }
   if (options.some((o) => o.length > 200)) return { error: 'Options must be 200 characters or fewer' }
-  if (!Number.isInteger(correct) || correct < 0 || correct >= options.length) return { error: 'Mark the correct answer' }
+  if (!Number.isInteger(correct) || correct < 0 || correct >= 3) return { error: 'Select the correct answer (A, B, or C)' }
   return { text, options, correct, explanation: String(req.body?.explanation || '').trim() }
 }
 
@@ -464,14 +467,67 @@ function readBulkQuestions(text) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const parts = line.split('|').map((p) => p.trim())
-    if (parts.length < 4) { errors.push(`Line ${i + 1}: expected text|optA|optB|optC|correctIndex|explanation`); continue }
+    if (parts.length < 4) { errors.push(`Line ${i + 1}: expected text|optA|optB|optC|correct(A/B/C or 0-2)|explanation`); continue }
     const qText = parts[0]
-    const correctIndex = Number(parts[parts.length - 2])
+    const correctRaw = String(parts[parts.length - 2] || '').trim().toUpperCase()
     const explanation = parts[parts.length - 1]
-    const optionList = parts.slice(1, -2)
-    if (optionList.length < 2) { errors.push(`Line ${i + 1}: needs at least 2 options`); continue }
-    if (!Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex >= optionList.length) { errors.push(`Line ${i + 1}: invalid correct index`); continue }
+    const optionList = parts.slice(1, -2).filter(Boolean)
+    if (optionList.length !== 3) { errors.push(`Line ${i + 1}: needs exactly 3 options (A, B, C)`); continue }
+    const correctIndex = /^[ABC]$/.test(correctRaw) ? 'ABC'.indexOf(correctRaw) : Number(correctRaw)
+    if (!Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex > 2) { errors.push(`Line ${i + 1}: correct answer must be A, B, C or 0-2`); continue }
     questions.push({ text: qText, options: optionList, correct: correctIndex, explanation: explanation || '' })
+  }
+  return { questions, errors }
+}
+
+function readBulkQuestionsFromExcel(buffer) {
+  const wb = XLSX.read(buffer, { type: 'buffer' })
+  const sheet = wb.Sheets[wb.SheetNames[0]]
+  if (!sheet) return { questions: [], errors: ['Excel file has no sheets'] }
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+  if (!rows.length) return { questions: [], errors: ['Excel sheet is empty'] }
+
+  const norm = (v) => String(v ?? '').trim()
+  const lower = (v) => norm(v).toLowerCase()
+  const header = rows[0].map(lower)
+  const hasHeader = header.some((h) => ['question', 'first answer', 'answer a', 'option a', 'correct answer', 'correct'].includes(h))
+
+  let idx = { q: 0, a: 1, b: 2, c: 3, correct: 4, explanation: 5 }
+  let dataRows = rows
+  if (hasHeader) {
+    const find = (...names) => header.findIndex((h) => names.map((n) => n.toLowerCase()).includes(h))
+    const q = find('question', 'questions', 'question text')
+    const a = find('first answer', 'answer a', 'option a', 'a', '1st answer')
+    const b = find('second answer', 'answer b', 'option b', 'b', '2nd answer')
+    const c = find('third answer', 'answer c', 'option c', 'c', '3rd answer')
+    const correct = find('correct answer', 'correct', 'answer', 'correct option')
+    const explanation = find('explanation', 'reason', 'why')
+    if ([q, a, b, c, correct].some((i) => i === -1)) {
+      return { questions: [], errors: ['Excel must have columns: question, first answer, second answer, third answer, correct answer (A/B/C)'] }
+    }
+    idx = { q, a, b, c, correct, explanation }
+    dataRows = rows.slice(1)
+  }
+
+  const questions = []
+  const errors = []
+  for (let i = 0; i < dataRows.length; i++) {
+    const row = dataRows[i] || []
+    const qText = norm(row[idx.q])
+    const optA = norm(row[idx.a])
+    const optB = norm(row[idx.b])
+    const optC = norm(row[idx.c])
+    const correctRaw = norm(row[idx.correct]).toUpperCase()
+    const explanation = idx.explanation >= 0 ? norm(row[idx.explanation]) : ''
+    if (!qText && !optA && !optB && !optC && !correctRaw) continue
+    const rowNum = i + (hasHeader ? 2 : 1)
+    if (!qText) { errors.push(`Row ${rowNum}: question text is required`); continue }
+    if (!optA || !optB || !optC) { errors.push(`Row ${rowNum}: all three answers (A, B, C) are required`); continue }
+    let correctIndex = -1
+    if (/^[ABC]$/.test(correctRaw)) correctIndex = 'ABC'.indexOf(correctRaw)
+    else if (/^[123]$/.test(correctRaw)) correctIndex = Number(correctRaw) - 1
+    if (correctIndex < 0 || correctIndex > 2) { errors.push(`Row ${rowNum}: correct answer must be A, B, or C`); continue }
+    questions.push({ text: qText, options: [optA, optB, optC], correct: correctIndex, explanation })
   }
   return { questions, errors }
 }
@@ -512,32 +568,37 @@ api.post('/topics/:id/questions', upload.fields([{ name: 'document', maxCount: 1
   res.status(201).json(shape(r))
 }))
 
-api.post('/topics/:id/questions/bulk', wrap(async (req, res) => {
+api.post('/topics/:id/questions/bulk', upload.single('file'), wrap(async (req, res) => {
   const topic = await prisma.topic.findUnique({ where: { id: req.params.id } })
   if (!topic) return res.status(404).json({ error: 'Sub topic not found' })
-  const { text } = req.body || {}
-  if (!text) return bad(res, 'Paste your questions to import')
   const MAX = 2000
-  const { questions, errors } = readBulkQuestions(text)
+  let parsed
+  if (req.file) {
+    try { parsed = readBulkQuestionsFromExcel(req.file.buffer) }
+    catch (e) { return bad(res, `Could not read Excel file: ${e.message}`) }
+  } else {
+    const { text } = req.body || {}
+    if (!text) return bad(res, 'Upload an Excel file or paste questions to import')
+    parsed = readBulkQuestions(text)
+  }
+  const { questions, errors } = parsed
   if (errors.length) return bad(res, `Import errors: ${errors.slice(0, 10).join('; ')}`)
   if (questions.length === 0) return bad(res, 'No valid questions found')
   if (questions.length > MAX) return bad(res, `You can import at most ${MAX} questions at once`)
   const existing = await prisma.question.count({ where: { topicId: req.params.id } })
   if (existing + questions.length > MAX) return bad(res, `This topic would exceed ${MAX} questions (currently ${existing})`)
-  const created = []
-  for (const q of questions) {
-    const r = await prisma.question.create({
+  const created = await prisma.$transaction(
+    questions.map((q) => prisma.question.create({
       data: {
         topicId: req.params.id,
         text: q.text,
         options: JSON.stringify(q.options),
         correct: q.correct,
-        explanation: q.explanation
+        explanation: q.explanation || ''
       }
-    })
-    created.push(shape(r))
-  }
-  res.status(201).json({ imported: created.length, questions: created })
+    }))
+  )
+  res.status(201).json({ imported: created.length, questions: created.map(shape) })
 }))
 
 api.put('/questions/:id', upload.fields([{ name: 'document', maxCount: 1 }, { name: 'headerImage', maxCount: 1 }]), wrap(async (req, res) => {
