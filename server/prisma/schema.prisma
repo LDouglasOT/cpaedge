@@ -23,16 +23,16 @@ model Admin {
 }
 
 model AdminInvite {
-  id            String   @id @default(dbgenerated("gen_random_uuid()"))
-  phone         String   @unique(map: "admin_invites_email_key")
-  token         String   @unique
-  role          String   @default("admin")
-  invitedBy     Admin?   @relation("AdminInvites", fields: [invitedById], references: [id], onDelete: SetNull)
-  invitedById   String?  @map("invited_by_id")
-  expiresAt     DateTime @map("expires_at") @db.Timestamptz(6)
-  accepted      Boolean  @default(false)
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  passwordHash  String?  @map("password_hash")
+  id           String   @id @default(dbgenerated("gen_random_uuid()"))
+  phone        String   @unique(map: "admin_invites_email_key")
+  token        String   @unique
+  role         String   @default("admin")
+  invitedById  String?  @map("invited_by_id")
+  expiresAt    DateTime @map("expires_at") @db.Timestamptz(6)
+  accepted     Boolean  @default(false)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  passwordHash String?  @map("password_hash")
+  invitedBy    Admin?   @relation("AdminInvites", fields: [invitedById], references: [id])
 
   @@map("admin_invites")
 }
@@ -56,35 +56,35 @@ model Topic {
   headerMime  String?    @map("header_mime")
   createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
   questions   Question[]
-  children    Topic[]    @relation("TopicHierarchy")
-  parent      Topic?     @relation("TopicHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
   course      Course     @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  parent      Topic?     @relation("TopicHierarchy", fields: [parentId], references: [id])
+  children    Topic[]    @relation("TopicHierarchy")
 
   @@map("topics")
 }
 
 model Question {
-  id               String    @id @default(dbgenerated("gen_random_uuid()"))
-  topicId          String    @map("topic_id")
-  topic            Topic     @relation(fields: [topicId], references: [id], onDelete: Cascade)
-  text             String
-  type             String    @default("objective")
-  options          String    @default("[]")
-  correct          Int       @default(0)
-  explanation      String    @default("")
-  documentFile     String?   @map("document_file")
-  documentName     String?   @map("document_name")
-  documentMime     String?   @map("document_mime")
-  headerImage      String?   @map("header_image")
-  headerMime       String?   @map("header_mime")
-  questionImages   String?   @map("question_images")
-  promptType       String    @default("text") @map("prompt_type")
-  answerType       String    @default("text") @map("answer_type")
-  modelAnswer      String    @default("") @map("model_answer")
-  modelAnswerImages String?  @map("model_answer_images")
-  modelAnswerMime  String?   @map("model_answer_mime")
-  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  attempts         Attempt[]
+  id                String    @id @default(dbgenerated("gen_random_uuid()"))
+  topicId           String    @map("topic_id")
+  text              String
+  type              String    @default("objective")
+  options           String    @default("[]")
+  correct           Int       @default(0)
+  explanation       String    @default("")
+  documentFile      String?   @map("document_file")
+  documentName      String?   @map("document_name")
+  documentMime      String?   @map("document_mime")
+  headerImage       String?   @map("header_image")
+  headerMime        String?   @map("header_mime")
+  questionImages    String?   @map("question_images")
+  promptType        String    @default("text") @map("prompt_type")
+  answerType        String    @default("text") @map("answer_type")
+  modelAnswer       String    @default("") @map("model_answer")
+  modelAnswerImages String?   @map("model_answer_images")
+  modelAnswerMime   String?   @map("model_answer_mime")
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  attempts          Attempt[]
+  topic             Topic     @relation(fields: [topicId], references: [id], onDelete: Cascade)
 
   @@map("questions")
 }
@@ -105,27 +105,27 @@ model Student {
   lastSeen     DateTime      @default(now()) @map("last_seen") @db.Timestamptz(6)
   attempts     Attempt[]
   transactions Transaction[]
-  waSessions   WASession[]
+  waSessions   WASession[]   @relation("StudentToWASession")
 
   @@index([phone], map: "idx_students_phone")
   @@map("students")
 }
 
 model Attempt {
-  id          String   @id @default(dbgenerated("gen_random_uuid()"))
-  studentId   String   @map("student_id")
-  student     Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  questionId  String   @map("question_id")
-  question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
-  selected    Int      @default(-1)
-  isCorrect   Boolean  @default(false) @map("is_correct")
-  answerText  String?  @map("answer_text")
-  answerImages String? @map("answer_images")
-  answerMime  String?  @map("answer_mime")
-  score       Int?
-  feedback    String?  @default("")
-  graded      Boolean  @default(false)
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  id           String   @id @default(dbgenerated("gen_random_uuid()"))
+  studentId    String   @map("student_id")
+  questionId   String   @map("question_id")
+  selected     Int      @default(-1)
+  isCorrect    Boolean  @default(false) @map("is_correct")
+  answerText   String?  @map("answer_text")
+  answerImages String?  @map("answer_images")
+  answerMime   String?  @map("answer_mime")
+  score        Int?
+  feedback     String?  @default("")
+  graded       Boolean  @default(false)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  question     Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  student      Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
   @@index([studentId], map: "idx_attempts_student")
   @@index([questionId], map: "idx_attempts_question")
@@ -135,7 +135,6 @@ model Attempt {
 model Transaction {
   id          String   @id @default(dbgenerated("gen_random_uuid()"))
   studentId   String?  @map("student_id")
-  student     Student? @relation(fields: [studentId], references: [id], onDelete: SetNull)
   phone       String?
   type        String
   amount      Float
@@ -146,8 +145,9 @@ model Transaction {
   providerRef String?  @map("provider_ref")
   note        String   @default("")
   createdById String?  @map("created_by_id")
-  createdBy   Admin?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  createdBy   Admin?   @relation(fields: [createdById], references: [id])
+  student     Student? @relation(fields: [studentId], references: [id])
 
   @@index([reference], map: "idx_transactions_reference")
   @@map("transactions")
@@ -161,12 +161,12 @@ model Setting {
 }
 
 model WASession {
-  id        String   @id
+  id        String    @id
   label     String
   phone     String?
-  status    String   @default("starting")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  students  Student[]
+  status    String    @default("starting")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  students  Student[] @relation("StudentToWASession")
 
   @@map("wa_sessions")
 }
