@@ -1,0 +1,2 @@
+ALTER TABLE questions ADD COLUMN IF NOT EXISTS header_image TEXT;
+ALTER TABLE questions ADD COLUMN IF NOT EXISTS header_mime TEXT;
