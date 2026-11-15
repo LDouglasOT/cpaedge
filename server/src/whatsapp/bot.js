@@ -75,7 +75,9 @@ async function sendQuestionImage(ctx, jid, q, pageIndex, topicName) {
   if (pageIndex > 0) buttonsList.push({ id: "qimg:" + q.id + ":" + (pageIndex - 1), text: "Previous" })
   if (pageIndex < total - 1) buttonsList.push({ id: "qimg:" + q.id + ":" + (pageIndex + 1), text: "Next" })
   buttonsList.push({ id: "submit_answer:" + q.id, text: "Submit Answer" })
-  if (q.type === "long" && q.modelAnswerImages && parseJsonSafe(q.modelAnswerImages, []).length) {
+  const hasModelAnswerImages = q.modelAnswerImages && parseJsonSafe(q.modelAnswerImages, []).length > 0
+  const hasModelAnswerText = q.modelAnswer && q.modelAnswer.trim().length > 0
+  if (q.type === "long" && (hasModelAnswerImages || hasModelAnswerText)) {
     buttonsList.push({ id: "get_answer:" + q.id + ":0", text: "Get Answer" })
   }
   buttonsList.push({ id: "explain:" + q.id, text: "Get Explanation" })
@@ -85,20 +87,37 @@ async function sendQuestionImage(ctx, jid, q, pageIndex, topicName) {
 
 async function sendModelAnswerImage(ctx, jid, q, pageIndex, topicName) {
   const aImgs = parseJsonSafe(q.modelAnswerImages, [])
-  if (!aImgs.length) return false
-  const img = aImgs[pageIndex]
-  if (!img?.file) return false
-  const buffer = await fetchFromS3(img.file)
-  if (!buffer) return false
-  const mime = img.mime || "image/jpeg"
-  const total = aImgs.length
-  const caption = total > 1 ? "*" + topicName + "* - Model Answer " + (pageIndex + 1) + " of " + total : "*" + topicName + "* - Model Answer"
+  const hasImages = aImgs.length > 0
+  const hasTextAnswer = q.modelAnswer && q.modelAnswer.trim().length > 0
+
+  if (!hasImages && !hasTextAnswer) return false
+
   const buttonsList = []
-  if (pageIndex > 0) buttonsList.push({ id: "get_answer:" + q.id + ":" + (pageIndex - 1), text: "Previous" })
-  if (pageIndex < total - 1) buttonsList.push({ id: "get_answer:" + q.id + ":" + (pageIndex + 1), text: "Next" })
+
+  if (hasImages) {
+    const img = aImgs[pageIndex]
+    if (!img?.file) return false
+    const buffer = await fetchFromS3(img.file)
+    if (!buffer) return false
+    const mime = img.mime || "image/jpeg"
+    const total = aImgs.length
+    const caption = total > 1 ? "*" + topicName + "* - Model Answer " + (pageIndex + 1) + " of " + total : "*" + topicName + "* - Model Answer"
+    if (pageIndex > 0) buttonsList.push({ id: "get_answer:" + q.id + ":" + (pageIndex - 1), text: "Previous" })
+    if (pageIndex < total - 1) buttonsList.push({ id: "get_answer:" + q.id + ":" + (pageIndex + 1), text: "Next" })
+    
+    if (hasTextAnswer && pageIndex === 0) {
+      await ctx.sock.sendMessage(jid, { image: buffer, mimetype: mime, caption: caption + "\n\n📝 *Model Answer:*\n" + q.modelAnswer })
+    } else {
+      await ctx.sock.sendMessage(jid, { image: buffer, mimetype: mime, caption: caption })
+    }
+  } else {
+    const caption = "*" + topicName + "* - Model Answer"
+    await text(ctx, jid, caption + "\n\n📝 *Model Answer:*\n" + q.modelAnswer)
+  }
+
   buttonsList.push({ id: "submit_answer:" + q.id, text: "Submit Answer" })
   buttonsList.push({ id: "explain:" + q.id, text: "Get Explanation" })
-  await buttons(ctx, jid, caption, buttonsList)
+  await buttons(ctx, jid, " ", buttonsList)
   return true
 }
 
@@ -411,7 +430,9 @@ async function serveQuestion(ctx, s, jid, q, { completed = false } = {}) {
     // Text-only long question: show text with submit/get answer/explanation buttons
     const body = (completed ? 'You have answered every question in this topic - cycling through them again.\n\n' : '') + '*' + topic.name + '*\n\n' + (q.text || '(Image question)')
     const btns = [{ id: 'submit_answer:' + q.id, text: 'Submit Answer' }]
-    if (q.modelAnswerImages && parseJsonSafe(q.modelAnswerImages, []).length) btns.push({ id: 'get_answer:' + q.id + ':0', text: 'Get Answer' })
+    const hasModelAnswerImages = q.modelAnswerImages && parseJsonSafe(q.modelAnswerImages, []).length > 0
+    const hasModelAnswerText = q.modelAnswer && q.modelAnswer.trim().length > 0
+    if (hasModelAnswerImages || hasModelAnswerText) btns.push({ id: 'get_answer:' + q.id + ':0', text: 'Get Answer' })
     btns.push({ id: 'explain:' + q.id, text: 'Get Explanation' })
     const footer = s.premium ? 'Premium' : 'Trial ' + Math.min(s.trialsUsed + (await hasAttempted(s.id, q.id) ? 0 : 1), await trialLimit()) + ' of ' + await trialLimit()
     await buttons(ctx, jid, body, btns, footer)
