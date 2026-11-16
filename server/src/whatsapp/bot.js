@@ -62,12 +62,25 @@ function parseJsonSafe(v, fallback) {
 }
 
 async function sendQuestionImage(ctx, jid, q, pageIndex, topicName) {
+  console.log('[sendQuestionImage] ENTER q.id:', q.id, 'pageIndex:', pageIndex, 'topicName:', topicName, 'jid:', jid)
   const qImgs = parseJsonSafe(q.questionImages, [])
-  if (!qImgs.length) return false
+  console.log('[sendQuestionImage] qImgs count:', qImgs.length)
+  if (!qImgs.length) {
+    console.log('[sendQuestionImage] returning false — no question images')
+    return false
+  }
   const img = qImgs[pageIndex]
-  if (!img?.file) return false
+  console.log('[sendQuestionImage] img:', JSON.stringify(img))
+  if (!img?.file) {
+    console.log('[sendQuestionImage] returning false — no img.file')
+    return false
+  }
   const buffer = await fetchFromS3(img.file)
-  if (!buffer) return false
+  console.log('[sendQuestionImage] buffer fetched:', buffer ? buffer.length + ' bytes' : 'null')
+  if (!buffer) {
+    console.log('[sendQuestionImage] returning false — no buffer from S3')
+    return false
+  }
   const mime = img.mime || "image/jpeg"
   const total = qImgs.length
   const caption = total > 1 ? "*" + topicName + "* - Question " + (pageIndex + 1) + " of " + total : "*" + topicName + "*"
@@ -86,38 +99,57 @@ async function sendQuestionImage(ctx, jid, q, pageIndex, topicName) {
 }
 
 async function sendModelAnswerImage(ctx, jid, q, pageIndex, topicName) {
+  console.log('[sendModelAnswerImage] ENTER q.id:', q.id, 'pageIndex:', pageIndex, 'topicName:', topicName, 'jid:', jid)
   const aImgs = parseJsonSafe(q.modelAnswerImages, [])
   const hasImages = aImgs.length > 0
   const hasTextAnswer = q.modelAnswer && q.modelAnswer.trim().length > 0
 
-  if (!hasImages && !hasTextAnswer) return false
+  console.log('[sendModelAnswerImage] hasImages:', hasImages, 'hasTextAnswer:', hasTextAnswer, 'aImgs count:', aImgs.length)
+
+  if (!hasImages && !hasTextAnswer) {
+    console.log('[sendModelAnswerImage] returning false — no images and no text answer')
+    return false
+  }
 
   const buttonsList = []
 
   if (hasImages) {
     const img = aImgs[pageIndex]
-    if (!img?.file) return false
+    console.log('[sendModelAnswerImage] img:', JSON.stringify(img))
+    if (!img?.file) {
+      console.log('[sendModelAnswerImage] returning false — no img.file')
+      return false
+    }
     const buffer = await fetchFromS3(img.file)
-    if (!buffer) return false
+    console.log('[sendModelAnswerImage] buffer fetched:', buffer ? buffer.length + ' bytes' : 'null')
+    if (!buffer) {
+      console.log('[sendModelAnswerImage] returning false — no buffer from S3')
+      return false
+    }
     const mime = img.mime || "image/jpeg"
     const total = aImgs.length
     const caption = total > 1 ? "*" + topicName + "* - Model Answer " + (pageIndex + 1) + " of " + total : "*" + topicName + "* - Model Answer"
     if (pageIndex > 0) buttonsList.push({ id: "get_answer:" + q.id + ":" + (pageIndex - 1), text: "Previous" })
     if (pageIndex < total - 1) buttonsList.push({ id: "get_answer:" + q.id + ":" + (pageIndex + 1), text: "Next" })
-    
+
     if (hasTextAnswer && pageIndex === 0) {
+      console.log('[sendModelAnswerImage] sending image with text caption')
       await ctx.sock.sendMessage(jid, { image: buffer, mimetype: mime, caption: caption + "\n\n📝 *Model Answer:*\n" + q.modelAnswer })
     } else {
+      console.log('[sendModelAnswerImage] sending image only')
       await ctx.sock.sendMessage(jid, { image: buffer, mimetype: mime, caption: caption })
     }
   } else {
+    console.log('[sendModelAnswerImage] sending text-only answer')
     const caption = "*" + topicName + "* - Model Answer"
     await text(ctx, jid, caption + "\n\n📝 *Model Answer:*\n" + q.modelAnswer)
   }
 
+  console.log('[sendModelAnswerImage] sending buttons')
   buttonsList.push({ id: "submit_answer:" + q.id, text: "Submit Answer" })
   buttonsList.push({ id: "explain:" + q.id, text: "Get Explanation" })
   await buttons(ctx, jid, " ", buttonsList)
+  console.log('[sendModelAnswerImage] returning true')
   return true
 }
 
@@ -128,18 +160,34 @@ export function parseIncoming(msg) {
   if (!m) return null
   m = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.documentWithCaptionMessage?.message || m
 
-  if (m.buttonsResponseMessage) return { id: m.buttonsResponseMessage.selectedButtonId, text: m.buttonsResponseMessage.selectedDisplayText || '' }
-  if (m.templateButtonReplyMessage) return { id: m.templateButtonReplyMessage.selectedId, text: m.templateButtonReplyMessage.selectedDisplayText || '' }
-  if (m.listResponseMessage) return { id: m.listResponseMessage.singleSelectReply?.selectedRowId, text: m.listResponseMessage.title || '' }
+  console.log('[parseIncoming] raw message keys:', Object.keys(m || {}))
+  console.log('[parseIncoming] full message:', JSON.stringify(m).slice(0, 2000))
+
+  if (m.buttonsResponseMessage) {
+    console.log('[parseIncoming] buttonsResponseMessage:', m.buttonsResponseMessage.selectedButtonId, m.buttonsResponseMessage.selectedDisplayText)
+    return { id: m.buttonsResponseMessage.selectedButtonId, text: m.buttonsResponseMessage.selectedDisplayText || '' }
+  }
+  if (m.templateButtonReplyMessage) {
+    console.log('[parseIncoming] templateButtonReplyMessage:', m.templateButtonReplyMessage.selectedId, m.templateButtonReplyMessage.selectedDisplayText)
+    return { id: m.templateButtonReplyMessage.selectedId, text: m.templateButtonReplyMessage.selectedDisplayText || '' }
+  }
+  if (m.listResponseMessage) {
+    console.log('[parseIncoming] listResponseMessage:', m.listResponseMessage.singleSelectReply?.selectedRowId, m.listResponseMessage.title)
+    return { id: m.listResponseMessage.singleSelectReply?.selectedRowId, text: m.listResponseMessage.title || '' }
+  }
   if (m.interactiveResponseMessage) {
     const ir = m.interactiveResponseMessage
     let id
     try {
       id = JSON.parse(ir.nativeFlowResponseMessage?.paramsJson || '{}').id
-    } catch {}
+    } catch (e) {
+      console.log('[parseIncoming] interactiveResponse parse error:', e.message)
+    }
+    console.log('[parseIncoming] interactiveResponse id:', id, 'text:', ir.body?.text)
     return { id, text: ir.body?.text || '' }
   }
   const text = m.conversation || m.extendedTextMessage?.text || ''
+  console.log('[parseIncoming] text message:', text.trim())
   return { id: null, text: text.trim() }
 }
 
@@ -179,7 +227,7 @@ const botName = async () => String(await getSetting('bot_name'))
 
 /* ---------- outbound helpers ---------- */
 
-const text = (ctx, jid, body) => ctx.sock.sendMessage(jid, { text: body })
+const text = (ctx, jid, body) => { console.log('[text] sending to', jid, ':', body.slice(0, 200)); return ctx.sock.sendMessage(jid, { text: body }) }
 
 /* Send typing indicator immediately so user knows bot is alive */
 const sendTyping = (ctx, jid) => ctx.sock.sendPresenceUpdate('composing', jid)
@@ -188,8 +236,10 @@ const sendTyping = (ctx, jid) => ctx.sock.sendPresenceUpdate('composing', jid)
 const markSeen = (ctx, msg) => ctx.sock.sendPresenceUpdate('read', msg.key.remoteJid, msg.key.id, msg.key.fromMe ? 'sender' : 'recipient')
 
 async function buttons(ctx, jid, body, list, footer) {
+  console.log('[buttons] sending to', jid, 'list:', list.map(b => b.id), 'body:', body.slice(0, 100))
   try {
     await ctx.x.sendButton(jid, { text: body, footer, buttons: list.map((b) => ({ id: b.id, text: clip(b.text, 20) })) })
+    console.log('[buttons] sendButton OK')
   } catch (err) {
     console.error('[bot] buttons failed, using text fallback:', err.message)
     await text(ctx, jid, `${body}\n\n${list.map((b) => `• ${b.text}`).join('\n')}`)
@@ -737,6 +787,8 @@ const queues = new Map()
 export function handleMessage(ctx, msg) {
   const jid = msg.key.remoteJid
   if (!jid || msg.key.fromMe || jid.endsWith('@g.us') || jid === 'status@broadcast' || jid.endsWith('@newsletter') || jid.endsWith('@broadcast')) return
+  console.log('[handleMessage] jid:', jid, 'msg.key:', JSON.stringify(msg.key))
+  console.log('[handleMessage] raw msg.message:', JSON.stringify(msg.message).slice(0, 3000))
   const prev = queues.get(jid) || Promise.resolve()
   const next = prev.then(() => process(ctx, msg, jid)).catch((e) => console.error('[bot] error:', e)).finally(() => { if (queues.get(jid) === next) queues.delete(jid) })
   queues.set(jid, next)
@@ -762,8 +814,11 @@ async function process(ctx, msg, jid) {
   const raw = (input.text || '').trim()
   const lower = raw.toLowerCase()
 
+  console.log('[process] phone:', phone, 'id:', id, 'raw:', JSON.stringify(raw), 'state.step:', state.step)
+
   if (id) {
     const [kind, a, b, c] = id.split(':')
+    console.log('[process] button kind:', kind, 'a:', a, 'b:', b, 'c:', c)
     switch (kind) {
       case 'menu': return showMenu(ctx, s, jid)
       case 'courses': return showMenu(ctx, s, jid, { page: Number(a) || 0 })
@@ -793,8 +848,20 @@ async function process(ctx, msg, jid) {
         const { q, completed } = await pickQuestion(s, cur.topicId)
         return serveQuestion(ctx, s, jid, q, { completed })
       }
-      case 'qimg': return sendQuestionImage(ctx, s, jid, await prisma.question.findUnique({ where: { id: a } }), Number(b), (await prisma.topic.findUnique({ where: { id: (await prisma.question.findUnique({ where: { id: a } })).topicId }, select: { name: true } })).name)
-      case 'get_answer': return sendModelAnswerImage(ctx, s, jid, await prisma.question.findUnique({ where: { id: a } }), Number(b), (await prisma.topic.findUnique({ where: { id: (await prisma.question.findUnique({ where: { id: a } })).topicId }, select: { name: true } })).name)
+      case 'qimg': {
+        const q = await prisma.question.findUnique({ where: { id: a } })
+        if (!q) return showMenu(ctx, s, jid)
+        const topic = await prisma.topic.findUnique({ where: { id: q.topicId }, select: { name: true } })
+        return sendQuestionImage(ctx, jid, q, Number(b), topic.name)
+      }
+      case 'get_answer': {
+        const q = await prisma.question.findUnique({ where: { id: a } })
+        if (!q) return showMenu(ctx, s, jid)
+        const topic = await prisma.topic.findUnique({ where: { id: q.topicId }, select: { name: true } })
+        console.log('[get_answer] q:', JSON.stringify(q).slice(0, 1500))
+        console.log('[get_answer] topic:', topic?.name, 'b:', b)
+        return sendModelAnswerImage(ctx, jid, q, Number(b), topic.name)
+      }
       case 'submit_answer': return handleSubmitAnswer(ctx, s, jid, a)
       case 'finish_answer': 
         console.log('[bot] finish_answer button clicked, qid:', a)
