@@ -55,6 +55,48 @@ async function uploadToS3(buffer, mime, originalName = "image.png") {
   return filename
 }
 
+// In-memory cache of student answer image buffers, keyed by their storage key.
+// Grading used to re-download every image from S3; if that second fetch fails the
+// images silently vanish and the AI reports "student's answer is not provided".
+// Keeping the freshly-uploaded buffer lets grading use it directly, with S3 as fallback.
+const imageBufferCache = new Map()
+function cacheImageBuffer(key, buffer, mime) {
+  if (!key || !buffer) return
+  imageBufferCache.set(key, { buffer, mime })
+  if (imageBufferCache.size > 200) {
+    const oldest = imageBufferCache.keys().next().value
+    if (oldest) imageBufferCache.delete(oldest)
+  }
+}
+function takeImageBuffer(key) {
+  if (!key) return null
+  const hit = imageBufferCache.get(key)
+  if (hit) imageBufferCache.delete(key)
+  return hit || null
+}
+
+// Extract an image media node from any message wrapper WhatsApp may use.
+function extractImageMedia(msg) {
+  const root = msg?.message
+  if (!root) return null
+  const candidates = [
+    root,
+    root.ephemeralMessage?.message,
+    root.viewOnceMessage?.message,
+    root.viewOnceMessageV2?.message,
+    root.viewOnceMessageV2Extension?.message,
+    root.documentWithCaptionMessage?.message,
+    root.ephemeralMessage?.message?.documentWithCaptionMessage?.message,
+    root.viewOnceMessageV2?.message?.documentWithCaptionMessage?.message
+  ]
+  for (const c of candidates) {
+    if (!c || typeof c !== 'object') continue
+    if (c.imageMessage) return c.imageMessage
+    if (c.documentMessage && String(c.documentMessage.mimetype || '').startsWith('image/')) return c.documentMessage
+  }
+  return null
+}
+
 /* ---------- long question helpers ---------- */
 
 function parseJsonSafe(v, fallback) {
@@ -599,17 +641,25 @@ async function handleStudentAnswer(ctx, s, jid, msg, qid) {
   let studentAnswerText = state.studentAnswerText || ''
   console.log('[bot] loaded images:', studentAnswerImages.length, 'text:', studentAnswerText)
   
-  // Handle image message
-  const m = msg.message
-  if (m?.imageMessage || m?.documentWithCaptionMessage?.message?.imageMessage) {
+  // Handle image message (plain image, document image, or wrapped)
+  const imgMsg = extractImageMedia(msg)
+  if (imgMsg) {
     console.log('[bot] image message detected')
-    const imgMsg = m.imageMessage || m.documentWithCaptionMessage.message.imageMessage
     try {
       const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: console, reuploadRequest: ctx.sock.reuploadRequest })
+      if (!buffer || !buffer.length) throw new Error('empty media buffer')
       const mime = imgMsg.mimetype || 'image/jpeg'
-      const filename = await uploadToS3(buffer, mime)
-      studentAnswerImages.push({ file: filename, mime, name: 'answer_' + Date.now() + '.jpg' })
-      console.log('[bot] image uploaded, total:', studentAnswerImages.length)
+      let file = null
+      try {
+        file = await uploadToS3(buffer, mime)
+      } catch (e) {
+        console.error('[bot] S3 upload failed, keeping buffer in memory only:', e.message)
+      }
+      if (!file) file = 'local_' + crypto.randomBytes(8).toString('hex') + '.' + (mime.split('/')[1] || 'jpg')
+      // Cache the buffer so grading does not depend on a second S3 download.
+      cacheImageBuffer(file, buffer, mime)
+      studentAnswerImages.push({ file, mime, name: 'answer_' + Date.now() + '.jpg' })
+      console.log('[bot] image captured, total:', studentAnswerImages.length)
     } catch (e) {
       console.error('[bot] failed to download student answer image:', e.message)
       await text(ctx, jid, 'Failed to download your image. Please try again.')
@@ -694,16 +744,20 @@ async function gradeAndSendResult(ctx, s, jid, q, studentAnswerText, studentAnsw
     if (buf) aImgBuffers.push({ buffer: buf, mime: img.mime || 'image/jpeg' })
   }
   
-  // Fetch student answer images from S3
+  // Fetch student answer images (prefer freshly-cached buffers, fall back to S3)
   const studentImgBuffers = []
   for (const img of studentAnswerImages) {
-    const buf = await fetchFromS3(img.file)
-    if (buf) studentImgBuffers.push({ buffer: buf, mime: img.mime || 'image/jpeg' })
+    const cached = takeImageBuffer(img.file)
+    const buf = cached ? cached.buffer : await fetchFromS3(img.file)
+    if (buf && buf.length) studentImgBuffers.push({ buffer: buf, mime: cached?.mime || img.mime || 'image/jpeg' })
+    else console.error('[bot] student answer image missing (cache + S3):', img.file)
   }
-  
-  // Grade with AI (include question explanation)
+  console.log('[bot] grading with', studentImgBuffers.length, 'student images')
+
+  // Grade with AI (include question explanation + question images)
   const { score, feedback } = await gradeLongAnswer({
     questionText: q.text || '',
+    questionImages: qImgBuffers,
     modelAnswer: q.modelAnswer || '',
     modelAnswerImages: aImgBuffers,
     studentAnswerText: studentAnswerText,
