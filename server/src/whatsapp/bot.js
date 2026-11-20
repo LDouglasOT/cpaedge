@@ -75,6 +75,11 @@ function takeImageBuffer(key) {
   return hit || null
 }
 
+function peekImageBuffer(key) {
+  if (!key) return null
+  return imageBufferCache.get(key) || null
+}
+
 // Extract an image media node from any message wrapper WhatsApp may use.
 function extractImageMedia(msg) {
   const root = msg?.message
@@ -747,10 +752,15 @@ async function gradeAndSendResult(ctx, s, jid, q, studentAnswerText, studentAnsw
   // Fetch student answer images (prefer freshly-cached buffers, fall back to S3)
   const studentImgBuffers = []
   for (const img of studentAnswerImages) {
-    const cached = takeImageBuffer(img.file)
+    console.log('[bot] grading: looking for student image:', img.file)
+    const cached = peekImageBuffer(img.file)
     const buf = cached ? cached.buffer : await fetchFromS3(img.file)
-    if (buf && buf.length) studentImgBuffers.push({ buffer: buf, mime: cached?.mime || img.mime || 'image/jpeg' })
-    else console.error('[bot] student answer image missing (cache + S3):', img.file)
+    if (buf && buf.length) {
+      studentImgBuffers.push({ buffer: buf, mime: cached?.mime || img.mime || 'image/jpeg' })
+      console.log('[bot] grading: got student image, size:', buf.length)
+    } else {
+      console.error('[bot] student answer image missing (cache + S3):', img.file)
+    }
   }
   console.log('[bot] grading with', studentImgBuffers.length, 'student images')
 
@@ -922,14 +932,17 @@ async function process(ctx, msg, jid) {
         // Directly proceed to grading when Done button is clicked
         const qForFinish = await prisma.question.findUnique({ where: { id: a } })
         if (!qForFinish) return showMenu(ctx, s, jid)
-        const stateForFinish = getState(s)
+        // Refresh student to get latest state from DB
+        const freshStudent = await fresh(s)
+        const stateForFinish = getState(freshStudent)
         const studentAnswerImages = stateForFinish.studentAnswerImages || []
         const studentAnswerText = stateForFinish.studentAnswerText || ''
+        console.log('[bot] finish_answer: images in state:', studentAnswerImages.length)
         if (studentAnswerImages.length === 0) {
           await text(ctx, jid, '❌ You must submit at least 1 image of your answer before finishing. Please send a photo of your work.')
           return
         }
-        return gradeAndSendResult(ctx, s, jid, qForFinish, studentAnswerText, studentAnswerImages)
+        return gradeAndSendResult(ctx, freshStudent, jid, qForFinish, studentAnswerText, studentAnswerImages)
       case 'pay':
         await setState(s, { step: 'await_msisdn' })
         return text(ctx, jid, '💳 Which mobile money number should we charge *' + await money(await premiumPrice()) + '* to?\n\nReply with the number (e.g. 0771234567), or reply *same* to use this WhatsApp number.')
