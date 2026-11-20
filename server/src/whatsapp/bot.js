@@ -108,8 +108,8 @@ function parseJsonSafe(v, fallback) {
   try { return JSON.parse(v || "") ?? fallback } catch { return fallback }
 }
 
-async function sendQuestionImage(ctx, jid, q, pageIndex, topicName) {
-  console.log('[sendQuestionImage] ENTER q.id:', q.id, 'pageIndex:', pageIndex, 'topicName:', topicName, 'jid:', jid)
+async function sendQuestionImage(ctx, jid, q, pageIndex, topicName, hideGetAnswer = false) {
+  console.log('[sendQuestionImage] ENTER q.id:', q.id, 'pageIndex:', pageIndex, 'topicName:', topicName, 'jid:', jid, 'hideGetAnswer:', hideGetAnswer)
   const qImgs = parseJsonSafe(q.questionImages, [])
   console.log('[sendQuestionImage] qImgs count:', qImgs.length)
   if (!qImgs.length) {
@@ -137,7 +137,7 @@ async function sendQuestionImage(ctx, jid, q, pageIndex, topicName) {
   buttonsList.push({ id: "submit_answer:" + q.id, text: "Submit Answer" })
   const hasModelAnswerImages = q.modelAnswerImages && parseJsonSafe(q.modelAnswerImages, []).length > 0
   const hasModelAnswerText = q.modelAnswer && q.modelAnswer.trim().length > 0
-  if (q.type === "long" && (hasModelAnswerImages || hasModelAnswerText)) {
+  if (!hideGetAnswer && q.type === "long" && (hasModelAnswerImages || hasModelAnswerText)) {
     buttonsList.push({ id: "get_answer:" + q.id + ":0", text: "Get Answer" })
   }
   buttonsList.push({ id: "explain:" + q.id, text: "Get Explanation" })
@@ -520,8 +520,10 @@ async function serveQuestion(ctx, s, jid, q, { completed = false } = {}) {
   // Long/image questions: send first question image page with paging controls
   if (q.type === 'long') {
     const qImgs = parseJsonSafe(q.questionImages, [])
+    const alreadyAttempted = await hasAttempted(s.id, q.id)
+    const hideGetAnswer = completed || alreadyAttempted
     if (qImgs.length > 0) {
-      await sendQuestionImage(ctx, jid, q, 0, topic.name)
+      await sendQuestionImage(ctx, jid, q, 0, topic.name, hideGetAnswer)
       return
     }
     // Text-only long question: show text with submit/get answer/explanation buttons
@@ -529,9 +531,9 @@ async function serveQuestion(ctx, s, jid, q, { completed = false } = {}) {
     const btns = [{ id: 'submit_answer:' + q.id, text: 'Submit Answer' }]
     const hasModelAnswerImages = q.modelAnswerImages && parseJsonSafe(q.modelAnswerImages, []).length > 0
     const hasModelAnswerText = q.modelAnswer && q.modelAnswer.trim().length > 0
-    if (hasModelAnswerImages || hasModelAnswerText) btns.push({ id: 'get_answer:' + q.id + ':0', text: 'Get Answer' })
+    if (!hideGetAnswer && (hasModelAnswerImages || hasModelAnswerText)) btns.push({ id: 'get_answer:' + q.id + ':0', text: 'Get Answer' })
     btns.push({ id: 'explain:' + q.id, text: 'Get Explanation' })
-    const footer = s.premium ? 'Premium' : 'Trial ' + Math.min(s.trialsUsed + (await hasAttempted(s.id, q.id) ? 0 : 1), await trialLimit()) + ' of ' + await trialLimit()
+    const footer = s.premium ? 'Premium' : 'Trial ' + Math.min(s.trialsUsed + (alreadyAttempted ? 0 : 1), await trialLimit()) + ' of ' + await trialLimit()
     await buttons(ctx, jid, body, btns, footer)
     return
   }
@@ -904,9 +906,14 @@ async function process(ctx, msg, jid) {
         return serveQuestion(ctx, s, jid, q, { completed })
       }
       case 'ans': return handleAnswer(ctx, s, jid, a, Number(b))
-      case 'retry': return serveQuestion(ctx, s, jid, await prisma.question.findUnique({ where: { id: a } }))
+      case 'retry': {
+        const q = await prisma.question.findUnique({ where: { id: a } })
+        if (!q) return showMenu(ctx, s, jid)
+        const { q: nextQ, completed } = await pickQuestion(s, q.topicId)
+        return serveQuestion(ctx, s, jid, nextQ, { completed })
+      }
       case 'explain': return handleExplain(ctx, s, jid, a)
-      case 'next': {
+case 'next': {
         const cur = await prisma.question.findUnique({ where: { id: a } })
         if (!cur) return showMenu(ctx, s, jid)
         const { q, completed } = await pickQuestion(s, cur.topicId)
@@ -916,7 +923,8 @@ async function process(ctx, msg, jid) {
         const q = await prisma.question.findUnique({ where: { id: a } })
         if (!q) return showMenu(ctx, s, jid)
         const topic = await prisma.topic.findUnique({ where: { id: q.topicId }, select: { name: true } })
-        return sendQuestionImage(ctx, jid, q, Number(b), topic.name)
+        const alreadyAttempted = await hasAttempted(s.id, q.id)
+        return sendQuestionImage(ctx, jid, q, Number(b), topic.name, alreadyAttempted)
       }
       case 'get_answer': {
         const q = await prisma.question.findUnique({ where: { id: a } })
