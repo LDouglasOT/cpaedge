@@ -200,6 +200,101 @@ async function sendModelAnswerImage(ctx, jid, q, pageIndex, topicName) {
   return true
 }
 
+/* ---------- all-at-once image senders ---------- */
+
+async function sendAllQuestionImages(ctx, jid, q, topicName, hideGetAnswer = false) {
+  console.log('[sendAllQuestionImages] ENTER q.id:', q.id, 'topicName:', topicName, 'jid:', jid, 'hideGetAnswer:', hideGetAnswer)
+  const qImgs = parseJsonSafe(q.questionImages, [])
+  if (!qImgs.length) {
+    console.log('[sendAllQuestionImages] returning false — no question images')
+    return false
+  }
+
+  // Send all images in sequence
+  for (let i = 0; i < qImgs.length; i++) {
+    const img = qImgs[i]
+    if (!img?.file) {
+      console.log('[sendAllQuestionImages] skipping image', i, '— no file')
+      continue
+    }
+    const buffer = await fetchFromS3(img.file)
+    if (!buffer) {
+      console.log('[sendAllQuestionImages] skipping image', i, '— no buffer from S3')
+      continue
+    }
+    const mime = img.mime || "image/jpeg"
+    const total = qImgs.length
+    const caption = total > 1 ? `*${topicName}* - Question ${i + 1} of ${total}` : `*${topicName}*`
+    try {
+      await ctx.sock.sendMessage(jid, { image: buffer, mimetype: mime, caption })
+    } catch (e) {
+      console.error('[sendAllQuestionImages] image send failed:', e.message)
+    }
+  }
+
+  // After all images, send the buttons
+  const buttonsList = [{ id: "submit_answer:" + q.id, text: "Submit Answer" }]
+  const hasModelAnswerImages = q.modelAnswerImages && parseJsonSafe(q.modelAnswerImages, []).length > 0
+  const hasModelAnswerText = q.modelAnswer && q.modelAnswer.trim().length > 0
+  if (!hideGetAnswer && q.type === "long" && (hasModelAnswerImages || hasModelAnswerText)) {
+    buttonsList.push({ id: "get_answer:" + q.id, text: "Get Answer" })
+  }
+  buttonsList.push({ id: "explain:" + q.id, text: "Get Explanation" })
+  await buttons(ctx, jid, " ", buttonsList)
+  console.log('[sendAllQuestionImages] returning true')
+  return true
+}
+
+async function sendAllModelAnswerImages(ctx, jid, q, topicName) {
+  console.log('[sendAllModelAnswerImages] ENTER q.id:', q.id, 'topicName:', topicName, 'jid:', jid)
+  const aImgs = parseJsonSafe(q.modelAnswerImages, [])
+  const hasImages = aImgs.length > 0
+  const hasTextAnswer = q.modelAnswer && q.modelAnswer.trim().length > 0
+
+  if (!hasImages && !hasTextAnswer) {
+    console.log('[sendAllModelAnswerImages] returning false — no images and no text answer')
+    return false
+  }
+
+  // Send all answer images
+  if (hasImages) {
+    for (let i = 0; i < aImgs.length; i++) {
+      const img = aImgs[i]
+      if (!img?.file) {
+        console.log('[sendAllModelAnswerImages] skipping image', i, '— no file')
+        continue
+      }
+      const buffer = await fetchFromS3(img.file)
+      if (!buffer) {
+        console.log('[sendAllModelAnswerImages] skipping image', i, '— no buffer from S3')
+        continue
+      }
+      const mime = img.mime || "image/jpeg"
+      const total = aImgs.length
+      const caption = total > 1 ? `*${topicName}* - Model Answer ${i + 1} of ${total}` : `*${topicName}* - Model Answer`
+      try {
+        await ctx.sock.sendMessage(jid, { image: buffer, mimetype: mime, caption })
+      } catch (e) {
+        console.error('[sendAllModelAnswerImages] image send failed:', e.message)
+      }
+    }
+  }
+
+  // Send text answer if present (after images)
+  if (hasTextAnswer) {
+    await text(ctx, jid, `*${topicName}* - Model Answer\n\n📝 *Model Answer:*\n${q.modelAnswer}`)
+  }
+
+  // Send buttons
+  const buttonsList = [
+    { id: "submit_answer:" + q.id, text: "Submit Answer" },
+    { id: "explain:" + q.id, text: "Get Explanation" }
+  ]
+  await buttons(ctx, jid, " ", buttonsList)
+  console.log('[sendAllModelAnswerImages] returning true')
+  return true
+}
+
 /* ---------- inbound parsing ---------- */
 
 export function parseIncoming(msg) {
@@ -517,13 +612,13 @@ async function serveQuestion(ctx, s, jid, q, { completed = false } = {}) {
     }
   }
 
-  // Long/image questions: send first question image page with paging controls
+  // Long/image questions: send all question image pages at once
   if (q.type === 'long') {
     const qImgs = parseJsonSafe(q.questionImages, [])
     const alreadyAttempted = await hasAttempted(s.id, q.id)
     const hideGetAnswer = completed || alreadyAttempted
     if (qImgs.length > 0) {
-      await sendQuestionImage(ctx, jid, q, 0, topic.name, hideGetAnswer)
+      await sendAllQuestionImages(ctx, jid, q, topic.name, hideGetAnswer)
       return
     }
     // Text-only long question: show text with submit/get answer/explanation buttons
@@ -932,7 +1027,7 @@ case 'next': {
         const topic = await prisma.topic.findUnique({ where: { id: q.topicId }, select: { name: true } })
         console.log('[get_answer] q:', JSON.stringify(q).slice(0, 1500))
         console.log('[get_answer] topic:', topic?.name, 'b:', b)
-        return sendModelAnswerImage(ctx, jid, q, Number(b), topic.name)
+        return sendAllModelAnswerImages(ctx, jid, q, topic.name)
       }
       case 'submit_answer': return handleSubmitAnswer(ctx, s, jid, a)
       case 'finish_answer': 
