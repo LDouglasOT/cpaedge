@@ -240,6 +240,7 @@ async function sendAllQuestionImages(ctx, jid, q, topicName, hideGetAnswer = fal
     buttonsList.push({ id: "get_answer:" + q.id, text: "Get Answer" })
   }
   buttonsList.push({ id: "explain:" + q.id, text: "Get Explanation" })
+  buttonsList.push({ id: "next:" + q.id, text: "Next Question" })
   await buttons(ctx, jid, " ", buttonsList)
   console.log('[sendAllQuestionImages] returning true')
   return true
@@ -288,7 +289,8 @@ async function sendAllModelAnswerImages(ctx, jid, q, topicName) {
   // Send buttons
   const buttonsList = [
     { id: "submit_answer:" + q.id, text: "Submit Answer" },
-    { id: "explain:" + q.id, text: "Get Explanation" }
+    { id: "explain:" + q.id, text: "Get Explanation" },
+    { id: "next:" + q.id, text: "Next Question" }
   ]
   await buttons(ctx, jid, " ", buttonsList)
   console.log('[sendAllModelAnswerImages] returning true')
@@ -626,8 +628,9 @@ async function serveQuestion(ctx, s, jid, q, { completed = false } = {}) {
     const btns = [{ id: 'submit_answer:' + q.id, text: 'Submit Answer' }]
     const hasModelAnswerImages = q.modelAnswerImages && parseJsonSafe(q.modelAnswerImages, []).length > 0
     const hasModelAnswerText = q.modelAnswer && q.modelAnswer.trim().length > 0
-    if (!hideGetAnswer && (hasModelAnswerImages || hasModelAnswerText)) btns.push({ id: 'get_answer:' + q.id + ':0', text: 'Get Answer' })
+    if (!hideGetAnswer && (hasModelAnswerImages || hasModelAnswerText)) btns.push({ id: 'get_answer:' + q.id, text: 'Get Answer' })
     btns.push({ id: 'explain:' + q.id, text: 'Get Explanation' })
+    btns.push({ id: 'next:' + q.id, text: 'Next Question' })
     const footer = s.premium ? 'Premium' : 'Trial ' + Math.min(s.trialsUsed + (alreadyAttempted ? 0 : 1), await trialLimit()) + ' of ' + await trialLimit()
     await buttons(ctx, jid, body, btns, footer)
     return
