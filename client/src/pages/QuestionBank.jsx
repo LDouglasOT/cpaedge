@@ -4,19 +4,21 @@ import { Modal, useLoad } from '../components.jsx'
 
 const LETTERS = ['A', 'B', 'C']
 
-function NameModal({ title, label, initial = '', withDescription, initialDescription = '', onClose, onSave }) {
+function NameModal({ title, label, initial = '', withDescription, initialDescription = '', withButtonLabel, initialButtonLabel = '', onClose, onSave }) {
   const [name, setName] = useState(initial)
   const [description, setDescription] = useState(initialDescription)
+  const [buttonLabel, setButtonLabel] = useState(initialButtonLabel)
   const [err, setErr] = useState('')
   const submit = async (e) => {
     e.preventDefault()
-    try { await onSave({ name, description }) } catch (e2) { setErr(e2.message) }
+    try { await onSave({ name, description, buttonLabel }) } catch (e2) { setErr(e2.message) }
   }
   return (
     <Modal title={title} onClose={onClose}>
       <form className="form" onSubmit={submit}>
         <label className="f"><span>{label}</span><input type="text" value={name} onChange={(e) => setName(e.target.value)} autoFocus /></label>
         {withDescription && <label className="f"><span>Description <small>(optional)</small></span><input type="text" value={description} onChange={(e) => setDescription(e.target.value)} /></label>}
+        {withButtonLabel && <label className="f"><span>Menu button text <small className="muted" style={{ fontWeight: 400 }}>(optional, defaults to "Choose")</small></span><input type="text" value={buttonLabel} onChange={(e) => setButtonLabel(e.target.value)} placeholder="Choose" /></label>}
         {err && <div className="err">{err}</div>}
         <div className="row" style={{ justifyContent: 'flex-end' }}>
           <button type="button" className="btn" onClick={onClose}>Cancel</button>
@@ -48,6 +50,10 @@ function TopicModal({ courseId, topic, parentId, onClose, onSaved, topics = [] }
   const [selectedParent, setSelectedParent] = useState(initialParent)
   const [headerImage, setHeaderImage] = useState(null)
   const [removeHeader, setRemoveHeader] = useState(false)
+  const [description, setDescription] = useState(topic?.description || '')
+  const [buttonLabel, setButtonLabel] = useState(topic?.buttonLabel || '')
+  const [price, setPrice] = useState(Number(topic?.price || 0))
+  const [locked, setLocked] = useState(!!topic?.locked)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -60,6 +66,10 @@ function TopicModal({ courseId, topic, parentId, onClose, onSaved, topics = [] }
     if (placement === 'submenu' && !effectiveParent) return setErr('Select a parent topic/subtopic')
     const form = new FormData()
     form.set('name', name)
+    form.set('description', description)
+    form.set('buttonLabel', buttonLabel)
+    form.set('price', String(price))
+    form.set('locked', locked ? 'true' : 'false')
     if (effectiveParent) form.set('parentId', effectiveParent)
     if (headerImage) form.set('headerImage', headerImage)
     if (removeHeader) form.set('remove_header', 'true')
@@ -96,6 +106,10 @@ function TopicModal({ courseId, topic, parentId, onClose, onSaved, topics = [] }
           </div>
         )}
         <label className="f"><span>{placement === 'submenu' && !topic ? 'Subtopic name' : 'Topic name'}</span><input type="text" value={name} onChange={(e) => setName(e.target.value)} autoFocus /></label>
+        <label className="f"><span>Description <small className="muted" style={{ fontWeight: 400 }}>(optional, shown on the topic card)</small></span><textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} placeholder="Enter a short description for this topic" /></label>
+        <label className="f"><span>Menu button text <small className="muted" style={{ fontWeight: 400 }}>(optional, defaults to "Choose")</small></span><input type="text" value={buttonLabel} onChange={(e) => setButtonLabel(e.target.value)} placeholder="Choose" /></label>
+        <label className="f"><span>Price (UGX) <small className="muted" style={{ fontWeight: 400 }}>(set to 0 for free)</small></span><input type="number" value={price} onChange={(e) => setPrice(Number(e.target.value) || 0)} min="0" placeholder="0" /></label>
+        <label className="f"><span>Locked <small className="muted" style={{ fontWeight: 400 }}>(requires purchase)</small></span><input type="checkbox" checked={locked} onChange={(e) => setLocked(e.target.checked)} /></label>
         <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Header image <small className="muted" style={{ fontWeight: 400 }}>(shown in WhatsApp menu)</small></span>
           {topic?.headerImage && !removeHeader && !headerImage && (
             <div className="row"><a href={`/uploads/${topic.headerImage}`} target="_blank" rel="noreferrer">Current image</a>
@@ -172,6 +186,7 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
   const [questionImages, setQuestionImages] = useState([null, null, null])
   const [answerImages, setAnswerImages] = useState([null, null, null])
   const [modelAnswer, setModelAnswer] = useState(question?.modelAnswer || '')
+  const [description, setDescription] = useState(question?.description || '')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -184,6 +199,7 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
     const form = new FormData()
     form.set('type', qType)
     form.set('explanation', explanation)
+    form.set('description', description)
 
     if (qType === 'objective') {
       const clean = options.map((o) => o.trim())
@@ -320,6 +336,7 @@ function QuestionModal({ topicId, question, onClose, onSaved }) {
         )}
 
         <label className="f"><span>Explanation <small>(shown when a student taps Explain)</small></span><textarea value={explanation} onChange={(e) => setExplanation(e.target.value)} placeholder="Why is this the correct answer?" rows={3} /></label>
+        <label className="f"><span>Description <small className="muted" style={{ fontWeight: 400 }}>(optional, shown on the question card)</small></span><textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Short description for this question" rows={2} /></label>
 
         <div className="f"><span style={{ fontWeight: 500, fontSize: 13 }}>Header image <small className="muted" style={{ fontWeight: 400 }}>(shown at top of question in WhatsApp)</small></span>
           {question?.headerImage && !removeHeader && !headerImage && (
@@ -357,7 +374,8 @@ function TopicDropdown({ topics, onSelect, onAddChild, onEdit, onDelete, selecte
               <div style={{ fontWeight: t.question_count > 0 ? 600 : 400 }}>
                 {'  '.repeat(depth)}{t.name} {t.headerImage && <span style={{ color: 'var(--primary)' }}>📷</span>}
               </div>
-              <small>{t.question_count} question{t.question_count === 1 ? '' : 's'}{t.children?.length ? ' · has submenus' : ''}</small>
+              {t.description && <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>{t.description}</div>}
+              <small>{t.question_count} question{t.question_count === 1 ? '' : 's'}{t.children?.length ? ' · has submenus' : ''}{t.locked && t.price > 0 ? ` · 🔒 ${t.price} UGX` : ''}{t.locked && t.price === 0 ? ' · 🔒 Locked' : ''}</small>
             </div>
             <div className="acts" onClick={(e) => e.stopPropagation()}>
               <button className="icon" title="Add submenu" onClick={() => onAddChild(t.id)}>➕</button>
@@ -454,6 +472,7 @@ export default function QuestionBank() {
               <div className="q" key={q.id}>
                 <div className="row between" style={{ alignItems: 'start' }}>
                   <div><b>{n + 1}.</b> {q.text}</div>
+                  {q.description && <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>{q.description}</div>}
                   <div className="row" style={{ flexWrap: 'nowrap' }}>
                     <button className="btn sm" onClick={() => setModal({ type: 'question', item: q })}>Edit</button>
                     <button className="btn sm danger" onClick={() => del('question', `/questions/${q.id}`)}>Delete</button>
@@ -478,7 +497,7 @@ export default function QuestionBank() {
       </div>
 
       {modal?.type === 'course' && (
-        <NameModal title={modal.item ? 'Rename course' : 'Add course'} label="Course name" withDescription initial={modal.item?.name} initialDescription={modal.item?.description}
+        <NameModal title={modal.item ? 'Rename course' : 'Add course'} label="Course name" withDescription withButtonLabel initial={modal.item?.name} initialDescription={modal.item?.description} initialButtonLabel={modal.item?.buttonLabel}
           onClose={() => setModal(null)}
           onSave={async (v) => {
             const saved = await api(modal.item ? `/courses/${modal.item.id}` : '/courses', { method: modal.item ? 'PUT' : 'POST', body: v })

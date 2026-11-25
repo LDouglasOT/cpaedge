@@ -16,6 +16,7 @@ import crypto from 'node:crypto'
 const PAGE = 9
 const LETTERS = ['A', 'B', 'C']
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
+const qn4 = n => n * 4
 
 const BUCKET = 'uploads'
 
@@ -457,13 +458,15 @@ async function showMenu(ctx, s, jid, { greet = false, page = 0 } = {}) {
   const coursesWithCount = courses
     .map((c) => {
       const qn = c.topics.reduce((sum, t) => sum + t.questions.length, 0)
+      const mqn = qn4(qn)
       return { 
         id: c.id, 
         name: c.name, 
         title: c.name, 
         description: c.description,
-        qn,
-        fullDescription: `${qn} question${qn === 1 ? '' : 's'}${c.description ? ' · ' + c.description : ''}` 
+        buttonLabel: c.buttonLabel,
+        qn: mqn,
+        fullDescription: `${mqn} question${mqn === 1 ? '' : 's'}${c.description ? ' · ' + c.description : ''}` 
       }
     })
     // Show all levels, even empty ones
@@ -479,9 +482,11 @@ async function showMenu(ctx, s, jid, { greet = false, page = 0 } = {}) {
   }
   if (!coursesWithCount.length) return text(ctx, jid, 'No levels are available yet. Please check back soon.')
   const status = s.premium ? '⭐ Premium — unlimited practice' : `🎁 Free trial: ${Math.max(0, await trialLimit() - s.trialsUsed)} of ${await trialLimit()} questions left`
+  const extraRows = s.premium ? [] : [{ title: '⭐ Go Premium', description: 'Unlock all topics', rowId: 'go_premium' }]
   await pagedList(ctx, jid, {
     title: 'Levels', body: `Choose what applies to you.\n${status}\n\nType *rank* any time to see your ranking.`,
-    button: 'Select an option', items: coursesWithCount.map(c => ({ id: c.id, title: c.name, description: c.fullDescription })), prefix: 'course', page, moreId: 'courses',
+    button: 'Choose', items: coursesWithCount.map(c => ({ id: c.id, title: c.name, description: c.fullDescription })), prefix: 'course', page, moreId: 'courses',
+    extraRows,
   })
 }
 
@@ -494,6 +499,13 @@ async function showTopics(ctx, s, jid, courseId, parentId = null, page = 0) {
     orderBy: { name: 'asc' },
     include: { _count: { select: { questions: true } } }
   })
+  
+  // Fetch purchased topic IDs for this student
+  const purchases = await prisma.topicPurchase.findMany({
+    where: { studentId: s.id },
+    select: { topicId: true }
+  })
+  const purchasedTopicIds = new Set(purchases.map((p) => p.topicId))
   
   const tree = buildTopicTree(allTopics, parentId)
   
@@ -518,39 +530,40 @@ async function showTopics(ctx, s, jid, courseId, parentId = null, page = 0) {
   const items = tree.map(t => {
     const hasChildren = t.children && t.children.length > 0
     const hasQuestions = t.qn > 0
-    
+    const mqn = qn4(t.qn)
+    const isLocked = t.locked && !purchasedTopicIds.has(t.id) && !s.premium
+    let computed
     if (hasChildren) {
-      // This is a parent topic - navigate into it
-      return {
-        id: t.id,
-        title: t.title,
-        description: `${t.children.length} submenu${t.children.length === 1 ? '' : 's'}${hasQuestions ? ` · ${t.qn} question${t.qn === 1 ? '' : 's'}` : ''}`,
-        isParent: true
-      }
+      computed = `${t.children.length} submenu${t.children.length === 1 ? '' : 's'}${hasQuestions ? ` · ${mqn} question${mqn === 1 ? '' : 's'}` : ''}`
     } else if (hasQuestions) {
-      // Leaf topic with questions - select to practice
-      return {
-        id: t.id,
-        title: t.title,
-        description: `${t.qn} question${t.qn === 1 ? '' : 's'}`,
-        isParent: false
+      if (isLocked) {
+        computed = `🔒 Locked · ${t.price} UGX to unlock`
+      } else {
+        computed = `${mqn} question${mqn === 1 ? '' : 's'}`
       }
     } else {
-      // Empty leaf topic
-      return {
-        id: t.id,
-        title: t.title,
-        description: 'No questions yet',
-        isParent: false
-      }
+      computed = ''
+    }
+    return {
+      id: t.id,
+      title: t.title,
+      description: t.description && t.description.trim() ? t.description : computed,
+      isParent: hasChildren,
+      locked: isLocked
     }
   })
   
+  // Build extra rows: back + go premium for non-premium
+  const extraRows = [{ title: backLabel, description: 'Go back', rowId: backId }]
+  if (!s.premium) {
+    extraRows.push({ title: '⭐ Go Premium', description: 'Unlock all topics', rowId: 'go_premium' })
+  }
+  
   await pagedList(ctx, jid, {
-    title: clip(title, 24), body: `*${title}*\nChoose what applies to you.`, button: 'Select an option',
+    title: clip(title, 24), body: `*${title}*\n${parentTopic?.description || course?.description || 'Choose what applies to you.'}`, button: parentTopic?.buttonLabel || course?.buttonLabel || 'Choose',
     items: items.map(i => ({ id: i.id, title: i.title, description: i.description })),
     prefix: 'topic', page, moreId: `topics:${courseId}:${parentId || 'root'}`,
-    extraRows: [{ title: backLabel, description: 'Go back', rowId: backId }],
+    extraRows,
   })
 }
 
@@ -987,6 +1000,12 @@ async function process(ctx, msg, jid) {
       case 'menu': return showMenu(ctx, s, jid)
       case 'courses': return showMenu(ctx, s, jid, { page: Number(a) || 0 })
       case 'course': return showTopics(ctx, s, jid, a)
+      case 'go_premium': {
+        const price = await getSetting('premium_price')
+        await text(ctx, jid, `💳 Premium: *${await money(Number(price))}*\n\nReply with the mobile money number to charge (e.g. 0771234567), or reply *same* to use this WhatsApp number.`)
+        await setState(s, { step: 'await_msisdn' })
+        return
+      }
       case 'topics': return showTopics(ctx, s, jid, a, b || null, Number(c) || 0)
       case 'topic_parent': return showTopics(ctx, s, jid, b, a || null)
       case 'topic': {
@@ -999,6 +1018,14 @@ async function process(ctx, msg, jid) {
         if (childrenCount > 0) {
           const course = await prisma.course.findUnique({ where: { id: topic.courseId } })
           return showTopics(ctx, s, jid, topic.courseId, a)
+        }
+        // Leaf topic: check purchase/lock before serving questions
+        if (topic.locked && !s.premium) {
+          const hasPurchased = await prisma.topicPurchase.findFirst({ where: { studentId: s.id, topicId: topic.id } })
+          if (!hasPurchased) {
+            await text(ctx, jid, `🔒 This topic is locked.\n\nPrice: *${topic.price} UGX*\n\nTap *Go Premium* to unlock all topics, or contact the admin to purchase access.`)
+            return
+          }
         }
         const { q, completed } = await pickQuestion(s, a)
         return serveQuestion(ctx, s, jid, q, { completed })

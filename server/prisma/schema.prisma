@@ -40,7 +40,8 @@ model AdminInvite {
 model Course {
   id          String   @id @default(dbgenerated("gen_random_uuid()"))
   name        String
-  description String   @default("")
+  description String   @default("") @map("description")
+  buttonLabel String   @default("") @map("button_label")
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   topics      Topic[]
 
@@ -50,6 +51,10 @@ model Course {
 model Topic {
   id          String     @id @default(dbgenerated("gen_random_uuid()"))
   name        String
+  description String   @default("") @map("description")
+  buttonLabel String   @default("") @map("button_label")
+  price       Int      @default(0) @map("price")
+  locked      Boolean  @default(false) @map("locked")
   courseId    String     @map("course_id")
   parentId    String?    @map("parent_id")
   headerImage String?    @map("header_image")
@@ -59,6 +64,7 @@ model Topic {
   course      Course     @relation(fields: [courseId], references: [id], onDelete: Cascade)
   parent      Topic?     @relation("TopicHierarchy", fields: [parentId], references: [id])
   children    Topic[]    @relation("TopicHierarchy")
+  purchases   TopicPurchase[] @relation("TopicToTopicPurchase")
 
   @@map("topics")
 }
@@ -67,6 +73,7 @@ model Question {
   id                String    @id @default(dbgenerated("gen_random_uuid()"))
   topicId           String    @map("topic_id")
   text              String
+  description       String    @default("") @map("description")
   type              String    @default("objective")
   options           String    @default("[]")
   correct           Int       @default(0)
@@ -89,6 +96,18 @@ model Question {
   @@map("questions")
 }
 
+model TopicPurchase {
+  id           String   @id @default(dbgenerated("gen_random_uuid()"))
+  studentId    String   @map("student_id")
+  topicId      String   @map("topic_id")
+  purchasedAt  DateTime @default(now()) @map("purchased_at")
+  student      Student  @relation("StudentToTopicPurchase", fields: [studentId], references: [id])
+  topic        Topic    @relation("TopicToTopicPurchase", fields: [topicId], references: [id])
+
+  @@unique([studentId, topicId], map: "topic_purchases_student_topic_key")
+  @@map("topic_purchases")
+}
+
 model Student {
   id           String        @id @default(dbgenerated("gen_random_uuid()"))
   phone        String        @unique
@@ -105,7 +124,8 @@ model Student {
   lastSeen     DateTime      @default(now()) @map("last_seen") @db.Timestamptz(6)
   attempts     Attempt[]
   transactions Transaction[]
-  waSessions   WASession[]   @relation("StudentToWASession")
+  waSessions   WASession[] @relation("StudentToWASession")
+  topicPurchases TopicPurchase[] @relation("StudentToTopicPurchase")
 
   @@index([phone], map: "idx_students_phone")
   @@map("students")

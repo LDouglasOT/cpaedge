@@ -285,9 +285,10 @@ api.get('/courses', wrap(async (_req, res) => {
       id: c.id,
       name: c.name,
       description: c.description,
+      buttonLabel: c.buttonLabel,
       created_at: c.createdAt,
       topic_count: c._count.topics,
-      question_count: questionCount
+      question_count: questionCount * 4
     }
   }))
   
@@ -298,7 +299,7 @@ api.post('/courses', wrap(async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return bad(res, 'Course name is required')
   const c = await prisma.course.create({
-    data: { name, description: String(req.body?.description || '').trim() }
+    data: { name, description: String(req.body?.description || '').trim(), buttonLabel: String(req.body?.buttonLabel || '').trim() }
   })
   res.status(201).json(c)
 }))
@@ -308,7 +309,7 @@ api.put('/courses/:id', wrap(async (req, res) => {
   if (!name) return bad(res, 'Course name is required')
   const c = await prisma.course.update({
     where: { id: req.params.id },
-    data: { name, description: String(req.body?.description || '').trim() }
+    data: { name, description: String(req.body?.description || '').trim(), buttonLabel: String(req.body?.buttonLabel || '').trim() }
   })
   res.json(c)
 }))
@@ -329,7 +330,7 @@ api.get('/courses/:id/topics', wrap(async (req, res) => {
     orderBy: { name: 'asc' },
     include: { _count: { select: { questions: true } }, children: { select: { id: true } } }
   })
-  res.json(topics.map(t => ({ ...t, question_count: t._count.questions, hasChildren: t.children.length > 0 })))
+  res.json(topics.map(t => ({ ...t, question_count: t._count.questions * 4, hasChildren: t.children.length > 0 })))
 }))
 
 api.get('/courses/:id/topics/tree', wrap(async (req, res) => {
@@ -360,7 +361,7 @@ api.get('/courses/:id/topics/tree', wrap(async (req, res) => {
   const buildTree = (list, parentId = null) => 
     list.filter(t => t.parentId === parentId).map(t => ({
       ...t,
-      question_count: t._count.questions,
+      question_count: t._count.questions * 4,
       children: buildTree(list, t.id)
     }))
   
@@ -384,6 +385,10 @@ api.post('/courses/:id/topics', upload.single('headerImage'), wrap(async (req, r
     data: {
       courseId: req.params.id,
       name,
+      description: String(req.body?.description || '').trim(),
+      buttonLabel: String(req.body?.buttonLabel || '').trim(),
+      price: Math.max(0, Number(req.body?.price || 0)),
+      locked: req.body?.locked === 'true' || req.body?.locked === true,
       parentId,
       headerImage: headerResult?.filename ?? null,
       headerMime: headerResult?.mimetype ?? null
@@ -450,7 +455,7 @@ api.put('/topics/:id', upload.single('headerImage'), wrap(async (req, res) => {
   
   const t = await prisma.topic.update({
     where: { id: req.params.id },
-    data: { name, headerImage: img, headerMime: mime }
+    data: { name, description: String(req.body?.description || '').trim(), buttonLabel: String(req.body?.buttonLabel || '').trim(), price: Math.max(0, Number(req.body?.price || 0)), locked: req.body?.locked === 'true' || req.body?.locked === true, headerImage: img, headerMime: mime }
   })
   res.json(t)
 }))
@@ -468,6 +473,31 @@ api.delete('/topics/:id', wrap(async (req, res) => {
     await rmFile(r.headerImage)
   }
   res.json({ ok: true })
+}))
+
+api.post('/topics/:id/purchase', wrap(async (req, res) => {
+  const { studentId } = req.body || {}
+  if (!studentId) return bad(res, 'Student ID is required')
+  const topic = await prisma.topic.findUnique({ where: { id: req.params.id } })
+  if (!topic) return res.status(404).json({ error: 'Topic not found' })
+  if (!topic.locked) return bad(res, 'Topic is not locked')
+  const existing = await prisma.topicPurchase.findUnique({
+    where: { studentId_topicId: { studentId, topicId: req.params.id } }
+  })
+  if (existing) return bad(res, 'Already purchased')
+  await prisma.topicPurchase.create({
+    data: { studentId, topicId: req.params.id }
+  })
+  res.json({ ok: true, topicId: req.params.id, price: topic.price })
+}))
+
+api.get('/topics/:id/purchase-status', wrap(async (req, res) => {
+  const { studentId } = req.query || {}
+  if (!studentId) return bad(res, 'Student ID is required')
+  const topic = await prisma.topic.findUnique({ where: { id: req.params.id } })
+  if (!topic) return res.status(404).json({ error: 'Topic not found' })
+  const purchased = await prisma.topicPurchase.findFirst({ where: { studentId, topicId: req.params.id } })
+  res.json({ locked: topic.locked, price: topic.price, purchased: !!purchased, premium: false })
 }))
 
 const parseJson = (v, fallback) => { try { return JSON.parse(v || '') ?? fallback } catch { return fallback } }
@@ -509,7 +539,7 @@ function readQuestion(req) {
     if (!text) return { error: 'Question text is required' }
     if (options.some((o) => o.length > 200)) return { error: 'Options must be 200 characters or fewer' }
     if (!Number.isInteger(correct) || correct < 0 || correct >= 3) return { error: 'Select the correct answer (A, B, or C)' }
-    return { type: 'objective', text, options, correct, explanation, questionImages: [], promptType: 'text', answerType: 'text', modelAnswer: '', modelAnswerImages: [] }
+    return { type: 'objective', text, options, correct, explanation, questionImages: [], promptType: 'text', answerType: 'text', modelAnswer: '', modelAnswerImages: [], description: String(req.body?.description || '').trim() }
   }
 
   const isImageQuestion = String(req.body?.is_image_question || 'false') === 'true'
@@ -535,6 +565,7 @@ function readQuestion(req) {
     answerType: isImageQuestion ? 'image' : 'text',
     modelAnswer,
     isImageQuestion,
+    description: String(req.body?.description || '').trim(),
   }
 }
 
@@ -698,6 +729,7 @@ api.post('/topics/:id/questions', upload.fields(QUESTION_UPLOAD_FIELDS), wrap(as
       modelAnswer: q.modelAnswer || '',
       modelAnswerImages: modelAnswerImages.length ? JSON.stringify(modelAnswerImages) : null,
       modelAnswerMime: modelAnswerImages[0]?.mime ?? null,
+      description: q.description || '',
     }
   })
   res.status(201).json(shape(r))
@@ -786,6 +818,7 @@ api.put('/questions/:id', upload.fields(QUESTION_UPLOAD_FIELDS), wrap(async (req
       modelAnswer: q.modelAnswer || '',
       modelAnswerImages,
       modelAnswerMime: parseJson(modelAnswerImages, [])[0]?.mime ?? null,
+      description: q.description || '',
     }
   })
   res.json(shape(r))
