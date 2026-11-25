@@ -1,0 +1,1 @@
+ALTER TABLE topics ADD COLUMN IF NOT EXISTS button_label TEXT DEFAULT '';
